@@ -310,6 +310,45 @@ struct MetalRowCacheTests {
         #expect(Self.sameBytes(second.pixels, first.pixels))
     }
 
+    @Test func synchronizedIdenticalRepaintReusesPreparedRows() async throws {
+        let harness = try #require(Harness())
+        let rows = harness.screenRows
+        let repaint = (0..<rows).map {
+            "\u{1b}[\($0 + 1);1H\u{1b}[2K" + Self.corpus[$0 % Self.corpus.count]
+        }.joined()
+        harness.view.feed(text: "\u{1b}[?25l" + repaint)
+        let first = try #require(await harness.frame())
+        for _ in 0..<4 {
+            harness.view.feed(text: "\u{1b}[?2026h" + repaint + "\u{1b}[?2026l")
+            let repeated = try #require(await harness.frame())
+            #expect(repeated.rebuilt == 0)
+            #expect(repeated.cached == rows)
+            #expect(repeated.rows == first.rows)
+            #expect(Self.sameBytes(repeated.pixels, first.pixels))
+            await expectParity(harness, with: repeated)
+        }
+    }
+
+    @Test func synchronizedRepaintPreparesOnlyTheChangedSpinnerRow() async throws {
+        let harness = try #require(Harness())
+        let rows = harness.screenRows
+        func repaint(_ spinner: String) -> String {
+            (0..<rows).map {
+                "\u{1b}[\($0 + 1);1H\u{1b}[2K" +
+                    ($0 == 0 ? spinner : Self.corpus[$0 % Self.corpus.count])
+            }.joined()
+        }
+        harness.view.feed(text: "\u{1b}[?25l" + repaint("|"))
+        _ = try #require(await harness.frame())
+        for spinner in ["/", "-", "\\", "|"] {
+            harness.view.feed(text: "\u{1b}[?2026h" + repaint(spinner) + "\u{1b}[?2026l")
+            let changed = try #require(await harness.frame())
+            #expect(changed.rebuilt == 1)
+            #expect(changed.cached == rows - 1)
+            await expectParity(harness, with: changed)
+        }
+    }
+
     /// DEC double-width and double-height lines place with a clip rectangle
     /// and a pivot that move with the row.
     @Test(.enabled(if: MetalRowCacheTests.metalIsUsable)) func decLineSizesMoveExactly() async throws {

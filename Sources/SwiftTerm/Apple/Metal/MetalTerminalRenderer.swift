@@ -528,9 +528,9 @@ struct RowCacheInputs {
 /// A class so that carrying every visible row from one frame's cache to the
 /// next costs a reference, not a copy of each of its arrays.
 final class RowCacheEntry {
-    /// The line's content generation when `prepared` was built. With the
-    /// line's identity, which keys the cache, it pins the cells.
-    let sourceGeneration: UInt64
+    /// The last generation proved equivalent to `prepared`.
+    var sourceGeneration: UInt64
+    private let content: TerminalSnapshot.Row.RenderContent
     /// The snapshot row's revision, compared only for BiDi rows (see
     /// `canReuse`). Snapshot rows are per screen position, so it is only
     /// meaningful at the same `screenRow`.
@@ -544,10 +544,11 @@ final class RowCacheEntry {
     /// Kept in the per-row persistent mode.
     var buffers: RowDrawBuffers?
 
-    init(sourceGeneration: UInt64, revision: UInt64, inputs: RowCacheInputs,
+    init(row: TerminalSnapshot.Row, inputs: RowCacheInputs,
          prepared: PreparedRow, screenRow: Int, data: RowDrawData?, buffers: RowDrawBuffers?) {
-        self.sourceGeneration = sourceGeneration
-        self.revision = revision
+        self.sourceGeneration = row.sourceGeneration
+        self.content = TerminalSnapshot.Row.RenderContent(row: row)
+        self.revision = row.revision
         self.inputs = inputs
         self.prepared = prepared
         self.screenRow = screenRow
@@ -556,7 +557,7 @@ final class RowCacheEntry {
     }
 
     func canReuse(for row: TerminalSnapshot.Row, inputs: RowCacheInputs, screenRow: Int) -> Bool {
-        guard sourceGeneration == row.sourceGeneration, self.inputs.matches(inputs) else {
+        guard self.inputs.matches(inputs) else {
             return false
         }
         // A BiDi row's layout depends on the other lines of its paragraph,
@@ -564,9 +565,10 @@ final class RowCacheEntry {
         // revision does, but only for the row at that position, so such a row
         // is reused only where it was built.
         if inputs.hasBidiLayout {
-            return revision == row.revision && self.screenRow == screenRow
+            return sourceGeneration == row.sourceGeneration &&
+                revision == row.revision && self.screenRow == screenRow
         }
-        return true
+        return sourceGeneration == row.sourceGeneration || content.matches(row)
     }
 }
 
@@ -1823,6 +1825,7 @@ final class MetalTerminalRenderer {
                     }
                 }
                 cached.revision = snapshotRow.revision
+                cached.sourceGeneration = snapshotRow.sourceGeneration
                 entry = cached
                 cachedRows += 1
             } else {
@@ -1844,8 +1847,7 @@ final class MetalTerminalRenderer {
                                        yOffset: yOffset,
                                        viewWidthPx: viewWidthPx,
                                        scale: scale)
-                entry = RowCacheEntry(sourceGeneration: snapshotRow.sourceGeneration,
-                                      revision: snapshotRow.revision,
+                entry = RowCacheEntry(row: snapshotRow,
                                       inputs: inputs,
                                       prepared: prepared,
                                       screenRow: screenRow,

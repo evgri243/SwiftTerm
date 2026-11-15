@@ -161,6 +161,46 @@ final class TerminalSnapshot {
         var images: [SnapshotImage]
         var revision: UInt64
 
+        /// Cache evidence must outlive refreshes of this pooled snapshot row.
+        /// Arena entries are immutable; extending their prefix cannot change
+        /// the meaning of these copied packed cells.
+        struct RenderContent {
+            private let cells: [PackedCell]
+            private let arena: CellArena
+            private let renderMode: BufferLine.RenderLineMode
+            private let isWrapped: Bool
+            private let resolvedCharacters: [Int: Character]
+            private let resolvedText: [Int: String]
+            private let hasPayload: Bool
+
+            init(row: Row) {
+                cells = (0..<row.line.count).map { row.line.packedCell(at: $0) }
+                arena = row.line.cellArena
+                renderMode = row.line.renderMode
+                isWrapped = row.line.isWrapped
+                resolvedCharacters = row.resolvedCharacters
+                resolvedText = row.resolvedText
+                hasPayload = cells.contains { $0.hasPayload }
+            }
+
+            func matches(_ row: Row) -> Bool {
+                // Payload targets have a separate lifetime from arena entries.
+                // Keep generation-based invalidation for those rows.
+                guard !hasPayload, arena === row.line.cellArena,
+                      renderMode == row.line.renderMode,
+                      isWrapped == row.line.isWrapped,
+                      cells.count == row.line.count,
+                      resolvedCharacters == row.resolvedCharacters,
+                      resolvedText == row.resolvedText else { return false }
+                for column in cells.indices {
+                    if cells[column] != row.line.packedCell(at: column) {
+                        return false
+                    }
+                }
+                return true
+            }
+        }
+
         init (source: BufferLine, borrowing: Bool = false,
               snapshotArena: CellArena? = nil) {
             if borrowing {
