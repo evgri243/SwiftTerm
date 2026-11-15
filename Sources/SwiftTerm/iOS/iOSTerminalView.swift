@@ -224,7 +224,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 
     /**
      * When true the host owns input routing. The view disables its stock tap, double-tap,
-     * triple-tap, long-press, one-finger mouse pan, selection pan and pointer-wheel
+     * triple-tap, long-press, hover, one-finger mouse pan, selection pan and pointer-wheel
      * recognizers, and never turns them back on when the mouse mode or buffer changes.
      * Local vertical scrolling of the scroll view and the selection rendering stay active.
      * The host then drives the view through ``sendHostMouse(action:button:modifiers:at:)``,
@@ -1684,6 +1684,8 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         }
         if #available(iOS 13.0, visionOS 1.0, *) {
             let hover = UIHoverGestureRecognizer(target: self, action: #selector(handleHover(_:)))
+            hover.isEnabled = !usesCustomInputGestures
+            stockInputGestures.append(hover)
             addGestureRecognizer(hover)
             hoverGesture = hover
         }
