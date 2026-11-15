@@ -4086,14 +4086,18 @@ extension TerminalView {
     {
         let tick = Profiling.begin(.frameTick)
         defer { tick.end() }
-        guard let viewState = captureFrameViewState() else { return }
 #if canImport(MetalKit)
         if usesRenderLoop {
+#if !os(macOS)
+            syncMobileViewportForRenderLoop()
+#endif
+            guard let viewState = captureFrameViewState() else { return }
             publishFrameViewState(viewState)
             renderLoop?.signal()
             return
         }
 #endif
+        guard let viewState = captureFrameViewState() else { return }
         guard let prepared = prepareFrame(viewState: viewState) else { return }
         applyFrameSideEffects(prepared.mainEffects)
         updateCursorPosition(from: prepared.cursor, rowCount: prepared.cursorRowCount)
@@ -4239,9 +4243,12 @@ extension TerminalView {
         guard let viewState = captureFrameViewState() else { return }
 #if canImport(MetalKit)
         // The render loop owns the snapshot, and under Metal the renderer draws
-        // the cursor itself — `caretView` is not on screen. Refreshing here
-        // would only race the loop for a caret nobody sees.
+        // the cursor itself — `caretView` is hidden visually, though on iOS its
+        // frame still tracks the cursor inside `UIScrollView`.
         if renderOwner.hasMetalRenderer {
+#if !os(macOS)
+            syncMobileViewportForRenderLoop(includeScroll: false)
+#endif
             frameDriver?.markDirty()
             return
         }
@@ -4250,6 +4257,100 @@ extension TerminalView {
             self?.updateCursorPosition(from: cursor, rowCount: rowCount)
         }
     }
+
+#if !os(macOS)
+    /// Keeps iOS `UIScrollView` geometry (`contentSize`/`contentOffset`) and
+    /// `caretView.frame` aligned with the terminal on the main actor before
+    /// publishing `FrameViewState` to the render loop.
+    @MainActor
+    private func syncMobileViewportForRenderLoop(includeScroll: Bool = true) {
+        guard terminal != nil else { return }
+        if includeScroll {
+            applyPendingViewUpdates()
+        }
+        struct MobileViewportSync {
+            var scrolledPosition: Double?
+            var cursorHidden: Bool
+            var cursorAbsoluteRow: Int
+            var cursorVisualCol: Int
+            var cursorColumnWidth: Int
+            var cursorRenderMode: BufferLine.RenderLineMode
+            var cursorInViewport: Bool
+        }
+        let sync: MobileViewportSync? = withTerminal { terminal in
+            guard !terminal.synchronizedOutputActive else { return nil }
+            let buffer = terminal.displayBuffer
+            let didScroll = includeScroll && consumeScrolledDirty()
+            if didScroll {
+                updateScrollerLocked()
+            }
+            let scrolledPosition: Double?
+            if didScroll {
+                if terminal.isDisplayBufferAlternate || buffer.yDisp <= 0 {
+                    scrolledPosition = 0
+                } else {
+                    let maxScrollback = buffer.lines.count - buffer.rows
+                    scrolledPosition = buffer.yDisp >= maxScrollback
+                        ? 1
+                        : Double(buffer.yDisp) / Double(maxScrollback)
+                }
+            } else {
+                scrolledPosition = nil
+            }
+            let screenRow = buffer.y + buffer.yBase - buffer.yDisp
+            let absoluteRow = buffer.yDisp + screenRow
+            let inViewport = screenRow >= 0 && screenRow < buffer.rows
+                && absoluteRow >= 0 && absoluteRow < buffer.lines.count
+            var visualCol = max(0, min(buffer.x, max(0, buffer.cols - 1)))
+            var columnWidth = 1
+            var renderMode: BufferLine.RenderLineMode = .single
+            if inViewport {
+                let line = buffer.lines[absoluteRow]
+                renderMode = line.renderMode
+                if visualCol < line.count {
+                    let width = Int(line.getWidth(index: visualCol))
+                    if width == 0, visualCol > 0 {
+                        visualCol -= 1
+                        columnWidth = max(1, Int(line.getWidth(index: visualCol)))
+                    } else if width > 0 {
+                        columnWidth = width
+                    }
+                }
+            }
+            return MobileViewportSync(
+                scrolledPosition: scrolledPosition,
+                cursorHidden: terminal.cursorHidden,
+                cursorAbsoluteRow: absoluteRow,
+                cursorVisualCol: visualCol,
+                cursorColumnWidth: columnWidth,
+                cursorRenderMode: renderMode,
+                cursorInViewport: inViewport)
+        }
+        guard let sync else { return }
+        if let position = sync.scrolledPosition {
+            terminalDelegate?.scrolled(source: self, position: position)
+        }
+        if let caretView {
+            if !sync.cursorInViewport {
+                caretView.removeFromSuperview()
+            } else {
+                if !sync.cursorHidden && caretView.superview != self {
+                    addSubview(caretView)
+                } else if sync.cursorHidden && caretView.superview == self {
+                    caretView.removeFromSuperview()
+                }
+                let doublePosition = sync.cursorRenderMode == .single ? 1.0 : 2.0
+                let offset = cellDimension.height * CGFloat(sync.cursorAbsoluteRow)
+                caretView.frame = CGRect(
+                    x: cellDimension.width * doublePosition * CGFloat(sync.cursorVisualCol),
+                    y: offset,
+                    width: cellDimension.width * doublePosition * CGFloat(sync.cursorColumnWidth),
+                    height: cellDimension.height)
+                caretView.powerlineRenderMode = sync.cursorRenderMode
+            }
+        }
+    }
+#endif
 
     func updateCursorPosition (from cursor: SnapshotCursor?, rowCount: Int)
     {

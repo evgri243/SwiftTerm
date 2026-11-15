@@ -195,6 +195,40 @@ struct MetalRendererConcurrencyTests {
         #expect(!view.isUsingMetalRenderer)
     }
 
+    @Test @MainActor func iosRenderLoopKeepsScrollGeometryAndCaretFrameSynchronized() throws {
+        guard MetalTerminalRenderer.shaderLibraryIsAvailable else { return }
+        let frame = CGRect(x: 0, y: 0, width: 320, height: 160)
+        let window = UIWindow(frame: frame)
+        window.isHidden = false
+        let view = TerminalView(frame: frame,
+                                font: nil,
+                                options: TerminalOptions(cols: 40, rows: 8, scrollback: 200))
+        defer { _ = view.updateUiClosed() }
+        window.addSubview(view)
+        view.layoutIfNeeded()
+        try view.setUseMetal(true)
+        #expect(view.isUsingRenderLoop)
+
+        let payload = (0..<60).map { "line \($0)\r\n" }.joined() + "tail"
+        view.feed(data: Data(payload.utf8))
+        view.frameTick()
+        #expect(view.contentSize.height > view.bounds.height * 3)
+        #expect(view.caretFrame.minY >= view.bounds.minY)
+        #expect(view.caretFrame.maxY <= view.bounds.maxY)
+
+        view.scrollTo(row: 5)
+        view.frameTick()
+        let savedOffset = view.contentOffset
+        #expect(abs(savedOffset.y - 5 * view.cellDimension.height) < 1)
+
+        // Shrinking the viewport height while following output keeps caretFrame inside bounds.
+        view.scroll(toPosition: 1)
+        view.frame.size.height = 96
+        view.layoutIfNeeded()
+        #expect(view.caretFrame.minY >= view.bounds.minY)
+        #expect(view.caretFrame.maxY <= view.bounds.maxY)
+    }
+
     @Test @MainActor func iosMetalSurfaceFallbackAndScaleOverrideWork() throws {
         guard MetalTerminalRenderer.shaderLibraryIsAvailable else { return }
         let frame = CGRect(x: 0, y: 0, width: 300, height: 160)
