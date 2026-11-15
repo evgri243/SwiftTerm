@@ -15,8 +15,12 @@
 //  renderer's debug counters.
 //
 
-#if os(macOS) && canImport(MetalKit) && DEBUG
+#if (os(macOS) || os(iOS)) && canImport(MetalKit) && DEBUG
+#if os(macOS)
 import AppKit
+#else
+import UIKit
+#endif
 import Metal
 import Testing
 @testable import SwiftTerm
@@ -310,6 +314,163 @@ struct MetalRowCacheTests {
         #expect(Self.sameBytes(second.pixels, first.pixels))
     }
 
+    @Test(.enabled(if: MetalRowCacheTests.metalIsUsable)) func synchronizedIdenticalRepaintReusesPreparedRows() async throws {
+        let harness = try #require(Harness())
+        let rows = harness.screenRows
+        let repaint = (0..<rows).map {
+            "\u{1b}[\($0 + 1);1H\u{1b}[2K" + Self.corpus[$0 % Self.corpus.count]
+        }.joined()
+        harness.view.feed(text: "\u{1b}[?25l" + repaint)
+        let first = try #require(await harness.frame())
+        for _ in 0..<4 {
+            harness.view.feed(text: "\u{1b}[?2026h" + repaint + "\u{1b}[?2026l")
+            let repeated = try #require(await harness.frame())
+            #expect(repeated.rebuilt == 0)
+            #expect(repeated.moved == 0)
+            #expect(repeated.cached == rows)
+            #expect(repeated.rows == first.rows)
+            #expect(Self.sameBytes(repeated.pixels, first.pixels))
+            await expectParity(harness, with: repeated)
+        }
+    }
+
+    @Test(.enabled(if: MetalRowCacheTests.metalIsUsable)) func synchronizedRepaintPreparesOnlyTheChangedSpinnerRow() async throws {
+        let harness = try #require(Harness())
+        let rows = harness.screenRows
+        func repaint(_ spinner: String) -> String {
+            (0..<rows).map {
+                "\u{1b}[\($0 + 1);1H\u{1b}[2K" +
+                    ($0 == 0 ? spinner : Self.corpus[$0 % Self.corpus.count])
+            }.joined()
+        }
+        harness.view.feed(text: "\u{1b}[?25l" + repaint("|"))
+        _ = try #require(await harness.frame())
+        for spinner in ["/", "-", "\\", "|"] {
+            harness.view.feed(text: "\u{1b}[?2026h" + repaint(spinner) + "\u{1b}[?2026l")
+            let changed = try #require(await harness.frame())
+            #expect(changed.rebuilt == 1)
+            #expect(changed.cached == rows - 1)
+            await expectParity(harness, with: changed)
+        }
+    }
+
+    /// JLine's inline Compose runner updates live TUI regions via synchronized
+    /// `flushStatic` scroll (`\r\n`) plus `CSI M` (delete lines) and `CSI L`
+    /// (insert lines), allocating fresh `BufferLine` objects with new
+    /// `RenderIdentity` tokens while most rows (including repeated `│...│`
+    /// box-drawing borders) keep identical cell contents.
+    @Test(.enabled(if: MetalRowCacheTests.metalIsUsable)) func jlineLineReallocationsReuseContentCachedRowsAndPlainBorders() async throws {
+        for mode in [MetalBufferingMode.perRowPersistent, .perFrameAggregated] {
+            let harness = try #require(Harness())
+            harness.view.metalBufferingMode = mode
+            #if os(iOS)
+            harness.view.font = UIFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+            #else
+            harness.view.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+            #endif
+            let rows = harness.screenRows
+            func tuiRows(spinner: String, step: Int) -> [String] {
+                var result: [String] = []
+                result.append("\u{1b}[38;2;95;105;125m┌──────────────────────────────────────────────────┐\u{1b}[0m")
+                result.append("\u{1b}[38;2;95;105;125m│\u{1b}[0m \u{1b}[1;36m\(spinner) Thinking\u{1b}[0m step \(step)                           \u{1b}[38;2;95;105;125m│\u{1b}[0m")
+                for body in 2..<(rows - 1) {
+                    if body % 3 == 0 {
+                        result.append("\u{1b}[38;2;95;105;125m│\u{1b}[0m                                                  \u{1b}[38;2;95;105;125m│\u{1b}[0m")
+                    } else {
+                        result.append("\u{1b}[38;2;95;105;125m│\u{1b}[0m \u{1b}[32m•\u{1b}[0m item \(body) \u{1b}[38;5;214mstatus=ok\u{1b}[0m                        \u{1b}[38;2;95;105;125m│\u{1b}[0m")
+                    }
+                }
+                result.append("\u{1b}[38;2;95;105;125m└──────────────────────────────────────────────────┘\u{1b}[0m")
+                return result
+            }
+
+            let initial = tuiRows(spinner: "|", step: 1)
+            harness.view.feed(text: "\u{1b}[?25l" + initial.enumerated().map {
+                "\u{1b}[\($0.offset + 1);1H\u{1b}[2K\($0.element)"
+            }.joined())
+            let first = try #require(await harness.frame())
+            #expect(first.rebuilt == rows)
+            // Top border, spinner row, empty bordered rows, and bottom border are pure ASCII + box drawing.
+            #expect(harness.renderer.debugPlainRowCount >= 5)
+
+            let beforeIdentities: [ObjectIdentifier] = harness.view.withTerminal { terminal in
+                let buffer = terminal.displayBuffer
+                return (0..<rows).map { ObjectIdentifier(buffer.lines[buffer.yDisp + $0].renderIdentity) }
+            }
+
+            // Simulate JLine deleting & re-inserting all TUI lines (`CSI M` + `CSI L`)
+            // and flushing one static history line (`\r\n`) while updating only the spinner row.
+            let updated = tuiRows(spinner: "/", step: 2)
+            var burst = "\u{1b}[?2026h"
+            burst += "\u{1b}[\(rows);1H\r\n"
+            burst += "\u{1b}[1;1H\u{1b}[\(rows)M\u{1b}[\(rows)L"
+            for (index, line) in updated.enumerated() {
+                burst += "\u{1b}[\(index + 1);1H\u{1b}[2K\(line)"
+            }
+            burst += "\u{1b}[?2026l"
+            harness.view.feed(text: burst)
+
+            let afterIdentities: [ObjectIdentifier] = harness.view.withTerminal { terminal in
+                let buffer = terminal.displayBuffer
+                return (0..<rows).map { ObjectIdentifier(buffer.lines[buffer.yDisp + $0].renderIdentity) }
+            }
+            #expect(Set(beforeIdentities).isDisjoint(with: Set(afterIdentities)))
+
+            let redrawn = try #require(await harness.frame())
+            #expect(redrawn.rebuilt == 1)
+            #expect(redrawn.cached == rows - 1)
+            await expectParity(harness, with: redrawn)
+        }
+    }
+
+    /// Content-keyed row caching never serves stale rows across combining-mark,
+    /// wide-glyph, SGR, or OSC 8 payload changes, and stays bounded by its LRU cap.
+    @Test(.enabled(if: MetalRowCacheTests.metalIsUsable)) func contentCacheInvalidationHazardsAndLRUCap() async throws {
+        let harness = try #require(Harness(scrollback: 500))
+        let rows = harness.screenRows
+
+        harness.view.linkHighlightMode = .always
+        let baseLines = [
+            "combining cafe\u{301} vs cafe\u{300}",
+            "wide 東京タワー and 한글",
+            "\u{1b}]8;;https://one.example\u{7}linked row\u{1b}]8;;\u{7}",
+            "\u{1b}[4:3;58;2;255;80;0munderlined\u{1b}[0m",
+        ]
+        fill(harness, lines: baseLines, count: rows)
+        _ = try #require(await harness.frame())
+
+        // Reallocate row 1..4 via CSI M / CSI L while mutating combining mark, CJK, and link URL.
+        let mutated = [
+            "0 combining cafe\u{300} vs cafe\u{301}",
+            "1 wide 大阪タワー and 한글",
+            "2 \u{1b}]8;;https://two.example\u{7}linked row\u{1b}]8;;\u{7}",
+            "3 \u{1b}[4:3;58;2;0;180;255munderlined\u{1b}[0m",
+        ]
+        var update = "\u{1b}[?2026h\u{1b}[1;1H\u{1b}[4M\u{1b}[4L"
+        for (i, row) in mutated.enumerated() {
+            update += "\u{1b}[\(i + 1);1H\u{1b}[2K\(row)"
+        }
+        update += "\u{1b}[?2026l"
+        harness.view.feed(text: update)
+        let afterHazards = try #require(await harness.frame())
+        #expect(afterHazards.rebuilt == 4)
+        await expectParity(harness, with: afterHazards)
+
+        // Feed > 300 distinct batches of visible frames to exceed the 256-entry cap.
+        for batch in 0..<28 {
+            var chunk = ""
+            for line in 0..<rows {
+                chunk += "\r\nunique-lru-row-\(batch)-\(line)-\(batch * 31 + line)"
+            }
+            harness.view.feed(text: chunk)
+            _ = try #require(await harness.frame())
+            #expect(harness.renderer.debugContentRowCacheCount <= 256)
+        }
+        let finalFrame = try #require(await harness.frame())
+        #expect(finalFrame.rebuilt == 0)
+        await expectParity(harness, with: finalFrame)
+    }
+
     /// DEC double-width and double-height lines place with a clip rectangle
     /// and a pivot that move with the row.
     @Test(.enabled(if: MetalRowCacheTests.metalIsUsable)) func decLineSizesMoveExactly() async throws {
@@ -376,6 +537,7 @@ struct MetalRowCacheTests {
         #expect(!Self.sameBytes(aggregated.pixels, before.pixels))
     }
 
+#if os(macOS)
     /// Translucent rows keep their colors after a scroll or an option change.
     @Test(.enabled(if: MetalRowCacheTests.metalIsUsable)) func translucentBackgroundsKeepCacheParity() async throws {
         let harness = try #require(Harness())
@@ -404,6 +566,7 @@ struct MetalRowCacheTests {
         #expect(disabled.rebuilt == rows)
         await expectParity(harness, with: disabled)
     }
+#endif
 
     // MARK: Invalidation
 
@@ -482,7 +645,7 @@ struct MetalRowCacheTests {
         fill(harness, lines: Self.corpus, count: harness.screenRows + 2)
         _ = try #require(await harness.frame())
 
-        harness.view.font = NSFont.monospacedSystemFont(ofSize: 15, weight: .regular)
+        harness.view.font = TTFont.monospacedSystemFont(ofSize: 15, weight: .regular)
         let font = try #require(await harness.frame())
         #expect(font.rebuilt == font.rows.count)
         await expectParity(harness, with: font)

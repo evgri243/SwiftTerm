@@ -491,20 +491,58 @@ struct MetalPlainTextTests {
         #expect(frame.plainRows == harness.screenRows)
     }
 
-    /// Rows with anything but plain cells take the shaped path; the plain
-    /// rows around them still do not.
+    /// Rows with anything that still needs Core Text shaping take the shaped
+    /// path; plain rows and custom box/block/Powerline rows around them do not.
     @Test(.enabled(if: MetalPlainTextTests.metalIsUsable)) func otherRowsKeepTheShapedPath() async throws {
         let harness = try #require(Harness())
         let shapedRows = [
-            "wide 漢字", "emoji 😀", "combining e\u{301}", "accented é", "box ┌─┐",
-            "powerline \u{e0b0}", "Hebrew שלום", "\u{1b}#6double width", "tab\there",
+            "wide 漢字", "emoji 😀", "combining e\u{301}", "accented é", "Hebrew שלום",
         ]
-        let plainRows = ["plain one", "\u{1b}[1;32mplain two\u{1b}[0m", "plain three"]
+        let plainRows = [
+            "box ┌─┐", "blocks ▀▄█░▒▓", "powerline \u{e0b0}",
+            "\u{1b}#6double width", "tab\there",
+            "plain one", "\u{1b}[1;32mplain two\u{1b}[0m",
+        ]
         harness.view.feed(text: (shapedRows + plainRows).joined(separator: "\r\n"))
         let frame = try #require(await expectParity(harness))
-        // A tab only moves the cursor, and the DEC line size is not a cell,
-        // so both of those rows are plain too, as are the blank rows below.
-        #expect(frame.plainRows == harness.screenRows - (shapedRows.count - 2))
+        #expect(frame.plainRows == harness.screenRows - shapedRows.count)
+    }
+
+    /// Custom box-drawing, block-element and Powerline cells emit space slots
+    /// plus shape geometry on the plain path, preserve pre-contrast shapeColor,
+    /// and fall back to the shaped path when `customBlockGlyphs` is off or a
+    /// shape cell is concealed (`SGR 8`).
+    @Test(.enabled(if: MetalPlainTextTests.metalIsUsable)) func customShapesUsePlainPathAndMatchShapedPixels() async throws {
+        for mode in [MetalBufferingMode.perRowPersistent, .perFrameAggregated] {
+            let harness = try #require(Harness())
+            harness.view.metalBufferingMode = mode
+            harness.view.minimumContrastRatio = 4.5
+            harness.view.linkHighlightMode = .always
+            let lines = [
+                "\u{1b}[38;2;90;95;110m┌──────────────┬────────────────────────┐\u{1b}[0m",
+                "\u{1b}[38;2;90;95;110m│\u{1b}[0m \u{1b}[1;32m* Ready\u{1b}[0m      \u{1b}[38;2;90;95;110m│\u{1b}[0m \u{1b}]8;;https://jb.gg\u{7}open link\u{1b}]8;;\u{7} ▀▄█▌▐░▒▓ \u{e0b0}\u{e0b2} \u{1b}[38;2;90;95;110m│\u{1b}[0m",
+                "\u{1b}[38;2;90;95;110m└──────────────┴────────────────────────┘\u{1b}[0m",
+            ]
+            harness.view.feed(text: lines.joined(separator: "\r\n"))
+            let plainFrame = try #require(await expectParity(harness))
+            #expect(plainFrame.plainRows == harness.screenRows)
+
+            harness.view.selection.setSelection(start: Position(col: 0, row: 0),
+                                                end: Position(col: 18, row: 1))
+            let selectedFrame = try #require(await expectParity(harness))
+            // Only the 2 newly selected rows are rebuilt; both take the plain path.
+            #expect(selectedFrame.plainRows == 2)
+            harness.view.selection.selectNone()
+
+            harness.view.customBlockGlyphs = false
+            let fontGlyphsFrame = try #require(await expectParity(harness))
+            #expect(fontGlyphsFrame.plainRows == harness.screenRows - lines.count)
+
+            harness.view.customBlockGlyphs = true
+            harness.view.feed(text: "\r\n\u{1b}[8m│ hidden border │\u{1b}[0m")
+            let concealedFrame = try #require(await expectParity(harness))
+            #expect(concealedFrame.plainRows == harness.screenRows - 1)
+        }
     }
 
     /// A font that is not plain draws everything shaped.

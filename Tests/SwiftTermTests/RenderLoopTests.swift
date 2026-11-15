@@ -6,7 +6,7 @@
 //  time, and it stops cleanly (io-gaps.md G1, WO-F4).
 //
 
-#if os(macOS)
+#if os(macOS) || os(iOS) || os(visionOS)
 import Testing
 import Foundation
 @testable import SwiftTerm

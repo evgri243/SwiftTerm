@@ -302,6 +302,11 @@ public final class BufferLine: CustomDebugStringConvertible {
     }
 
     @inline(__always)
+    func withPackedCells<R>(_ body: (UnsafeBufferPointer<PackedCell>) -> R) -> R {
+        storage.withPackedCells(body)
+    }
+
+    @inline(__always)
     func setPackedCell(_ cell: PackedCell, at index: Int) {
         let target = min(index, storage.count - 1)
         storage.setRawCell(cell, at: target)

@@ -522,21 +522,114 @@ struct RowCacheInputs {
     }
 }
 
+/// Lookup hint for the bounded content-keyed `PreparedRow` fallback cache.
+/// Reuse still requires exact cell, arena, and input equality (`ContentRowCacheEntry.matches`).
+struct RowContentKey: Hashable {
+    let rawHash: Int
+
+    static func make(row: TerminalSnapshot.Row, cols: Int, inputs: RowCacheInputs) -> RowContentKey? {
+        guard !inputs.hasBidiLayout else { return nil }
+        let line = row.line
+        return line.withPackedCells { cells in
+            var combinedPayloads: UInt16 = 0
+            for cell in cells {
+                combinedPayloads |= cell.payloadCode
+            }
+            guard combinedPayloads == 0 else { return nil }
+            var hasher = Hasher()
+            hasher.combine(cols)
+            hasher.combine(cells.count)
+            hasher.combine(line.renderMode)
+            hasher.combine(line.isWrapped)
+            hasher.combine(ObjectIdentifier(line.cellArena))
+            hasher.combine(inputs.selection)
+            hasher.combine(inputs.link)
+            hasher.combine(inputs.images.count)
+            for image in inputs.images {
+                hasher.combine(ObjectIdentifier(image.image))
+                hasher.combine(image.pixelWidth)
+                hasher.combine(image.pixelHeight)
+                hasher.combine(image.col)
+            }
+            hasher.combine(row.resolvedText.count)
+            hasher.combine(bytes: UnsafeRawBufferPointer(cells))
+            return RowContentKey(rawHash: hasher.finalize())
+        }
+    }
+}
+
+/// Position-independent `PreparedRow` cached by content so line reallocations
+/// (such as JLine `CSI L` / `CSI M` / scroll redraws) and identical repaints
+/// reuse shaped rows without copying cells on `sourceIdentity` fast-path hits.
+final class ContentRowCacheEntry {
+    let key: RowContentKey
+    private let cells: [PackedCell]
+    private let arena: CellArena
+    private let cols: Int
+    private let renderMode: BufferLine.RenderLineMode
+    private let isWrapped: Bool
+    private let resolvedCharacters: [Int: Character]
+    private let resolvedText: [Int: String]
+    let inputs: RowCacheInputs
+    let prepared: PreparedRow
+    var lastUsedFrame: UInt64
+
+    init(key: RowContentKey, row: TerminalSnapshot.Row, cols: Int,
+         inputs: RowCacheInputs, prepared: PreparedRow, frame: UInt64) {
+        self.key = key
+        self.cells = row.line.withPackedCells { Array($0) }
+        self.arena = row.line.cellArena
+        self.cols = cols
+        self.renderMode = row.line.renderMode
+        self.isWrapped = row.line.isWrapped
+        self.resolvedCharacters = row.resolvedCharacters
+        self.resolvedText = row.resolvedText
+        self.inputs = inputs
+        self.prepared = prepared
+        self.lastUsedFrame = frame
+    }
+
+    func matches(row: TerminalSnapshot.Row, cols: Int, inputs: RowCacheInputs) -> Bool {
+        let line = row.line
+        guard self.cols == cols,
+              arena === line.cellArena,
+              renderMode == line.renderMode,
+              isWrapped == line.isWrapped,
+              cells.count == line.count,
+              self.inputs.matches(inputs),
+              resolvedCharacters == row.resolvedCharacters,
+              resolvedText == row.resolvedText else {
+            return false
+        }
+        if cells.isEmpty {
+            return true
+        }
+        return cells.withUnsafeBytes { cachedRaw in
+            line.withPackedCells { liveCells in
+                let liveRaw = UnsafeRawBufferPointer(liveCells)
+                return cachedRaw.count == liveRaw.count &&
+                    memcmp(cachedRaw.baseAddress!, liveRaw.baseAddress!, cachedRaw.count) == 0
+            }
+        }
+    }
+}
+
 /// A row's cached draw data, keyed by the buffer line it shows rather than by
 /// screen row, so it survives scrolling.
 ///
 /// A class so that carrying every visible row from one frame's cache to the
 /// next costs a reference, not a copy of each of its arrays.
 final class RowCacheEntry {
-    /// The line's content generation when `prepared` was built. With the
-    /// line's identity, which keys the cache, it pins the cells.
-    let sourceGeneration: UInt64
+    /// The line's content generation when `prepared` was built or last verified.
+    /// With the line's identity, which keys the cache, it pins the cells.
+    var sourceGeneration: UInt64
     /// The snapshot row's revision, compared only for BiDi rows (see
     /// `canReuse`). Snapshot rows are per screen position, so it is only
     /// meaningful at the same `screenRow`.
     var revision: UInt64
     let inputs: RowCacheInputs
     let prepared: PreparedRow
+    var contentEntry: ContentRowCacheEntry?
     /// The screen row `data` or `buffers` are placed at.
     var screenRow: Int
     /// Kept in the per-frame aggregated mode.
@@ -545,11 +638,13 @@ final class RowCacheEntry {
     var buffers: RowDrawBuffers?
 
     init(sourceGeneration: UInt64, revision: UInt64, inputs: RowCacheInputs,
-         prepared: PreparedRow, screenRow: Int, data: RowDrawData?, buffers: RowDrawBuffers?) {
+         prepared: PreparedRow, contentEntry: ContentRowCacheEntry? = nil,
+         screenRow: Int, data: RowDrawData?, buffers: RowDrawBuffers?) {
         self.sourceGeneration = sourceGeneration
         self.revision = revision
         self.inputs = inputs
         self.prepared = prepared
+        self.contentEntry = contentEntry
         self.screenRow = screenRow
         self.data = data
         self.buffers = buffers
@@ -1087,6 +1182,11 @@ final class MetalTerminalRenderer {
     private var kittyTextureCache: [UInt32: (signature: KittyImageSignature, texture: MTLTexture)] = [:]
     /// Keyed by the identity of the buffer line each visible row shows.
     private var rowCache: [ObjectIdentifier: RowCacheEntry] = [:]
+    private static let maxContentRowCacheEntries = 256
+    private static let maxContentBucketEntries = 4
+    private var contentRowCache: [RowContentKey: [ContentRowCacheEntry]] = [:]
+    private var contentRowCacheCount = 0
+    private var contentCacheFrame: UInt64 = 0
     private var cacheSignature: CacheSignature?
     private var atlasInvalidatedDuringBuild = false
     private let redrawState: MetalRedrawState
@@ -1170,6 +1270,55 @@ final class MetalTerminalRenderer {
     /// from scratch with the same glyph atlas.
     func discardRowCache() {
         rowCache.removeAll()
+        clearContentRowCache()
+    }
+
+    private func clearContentRowCache() {
+        contentRowCache.removeAll()
+        contentRowCacheCount = 0
+    }
+
+    private func lookupContentRowCache(key: RowContentKey,
+                                       row: TerminalSnapshot.Row,
+                                       cols: Int,
+                                       inputs: RowCacheInputs) -> ContentRowCacheEntry? {
+        guard let bucket = contentRowCache[key] else { return nil }
+        for candidate in bucket where candidate.matches(row: row, cols: cols, inputs: inputs) {
+            candidate.lastUsedFrame = contentCacheFrame
+            return candidate
+        }
+        return nil
+    }
+
+    private func insertContentRowCache(_ entries: [ContentRowCacheEntry]) {
+        for entry in entries {
+            var bucket = contentRowCache[entry.key] ?? []
+            if bucket.contains(where: { $0 === entry }) {
+                continue
+            }
+            if bucket.count >= Self.maxContentBucketEntries {
+                if let oldestIndex = bucket.indices.min(by: { bucket[$0].lastUsedFrame < bucket[$1].lastUsedFrame }) {
+                    bucket.remove(at: oldestIndex)
+                    contentRowCacheCount -= 1
+                }
+            }
+            bucket.append(entry)
+            contentRowCache[entry.key] = bucket
+            contentRowCacheCount += 1
+        }
+        guard contentRowCacheCount > Self.maxContentRowCacheEntries else { return }
+        var allEntries: [ContentRowCacheEntry] = []
+        allEntries.reserveCapacity(contentRowCacheCount)
+        for (_, bucket) in contentRowCache {
+            allEntries.append(contentsOf: bucket)
+        }
+        allEntries.sort { $0.lastUsedFrame > $1.lastUsedFrame }
+        let kept = Array(allEntries.prefix(Self.maxContentRowCacheEntries))
+        contentRowCache.removeAll(keepingCapacity: true)
+        for entry in kept {
+            contentRowCache[entry.key, default: []].append(entry)
+        }
+        contentRowCacheCount = kept.count
     }
 
     /// Asks the host to schedule a frame. A callback rather than a reference to
@@ -1214,6 +1363,9 @@ final class MetalTerminalRenderer {
 
     /// The last frame's rows built from plain cells without shaping.
     var debugPlainRowCount: Int { debugRowsPlain }
+
+    /// Current entry count in the bounded content-keyed secondary row cache.
+    var debugContentRowCacheCount: Int { contentRowCacheCount }
 #endif
 #if DEBUG
     private var imageTextureFailures: Set<ObjectIdentifier> = []
@@ -1673,6 +1825,7 @@ final class MetalTerminalRenderer {
             // was cached after the flush along with the rows that followed.
             // Drop them all so the retry pass rebuilds every row.
             rowCache.removeAll()
+            clearContentRowCache()
             attempt += 1
             if ProfilingStats.enabled {
                 activeProfileCounters.atlasInvalidationBuildAttempts += 1
@@ -1751,6 +1904,7 @@ final class MetalTerminalRenderer {
                 scaledFontCache.removeAll()
             }
             rowCache.removeAll()
+            clearContentRowCache()
             cacheSignature = signature
         }
 
@@ -1769,10 +1923,12 @@ final class MetalTerminalRenderer {
                                       otherImageDraws: [])
         }
 
+        contentCacheFrame &+= 1
         // Entries move from the previous frame's cache to this frame's as
         // their lines are found on screen; lines no longer visible drop out.
         var visibleRowCache: [ObjectIdentifier: RowCacheEntry] = [:]
         visibleRowCache.reserveCapacity(lastRow - firstRow + 1)
+        var newlyBuiltContentEntries: [ContentRowCacheEntry] = []
         var rebuiltRows = 0
         var cachedRows = 0
         var movedRows = 0
@@ -1789,6 +1945,7 @@ final class MetalTerminalRenderer {
             let previous = rowCache.removeValue(forKey: sourceIdentity)
             if let cached = previous,
                cached.canReuse(for: snapshotRow, inputs: inputs, screenRow: screenRow) {
+                cached.contentEntry?.lastUsedFrame = contentCacheFrame
                 let moved = cached.screenRow != screenRow
                 let needsPlacement: Bool
                 switch bufferingMode {
@@ -1826,33 +1983,118 @@ final class MetalTerminalRenderer {
                 entry = cached
                 cachedRows += 1
             } else {
-                let rowInterval = Profiling.begin(.metalRowBuild)
-                defer { rowInterval.end() }
-                let prepared = prepareRow(row: snapshotRow,
-                                          absoluteRow: absoluteRow,
-                                          context: context,
-                                          cellWidth: cellWidth,
-                                          cellHeight: cellHeight,
-                                          yOffset: yOffset,
-                                          scale: scale)
-                let rowData = placeRow(prepared,
-                                       screenRow: screenRow,
-                                       snapshot: snapshot,
-                                       context: context,
-                                       cellWidth: cellWidth,
-                                       cellHeight: cellHeight,
-                                       yOffset: yOffset,
-                                       viewWidthPx: viewWidthPx,
-                                       scale: scale)
-                entry = RowCacheEntry(sourceGeneration: snapshotRow.sourceGeneration,
-                                      revision: snapshotRow.revision,
-                                      inputs: inputs,
-                                      prepared: prepared,
-                                      screenRow: screenRow,
-                                      data: bufferingMode == .perFrameAggregated ? rowData : nil,
-                                      buffers: bufferingMode == .perRowPersistent
-                                        ? makeRowBuffers(from: rowData, reusing: previous?.buffers) : nil)
-                rebuiltRows += 1
+                let contentKey = RowContentKey.make(row: snapshotRow, cols: context.cols, inputs: inputs)
+                if let contentKey,
+                   let contentHit = lookupContentRowCache(key: contentKey,
+                                                          row: snapshotRow,
+                                                          cols: context.cols,
+                                                          inputs: inputs) {
+                    if let cached = previous, cached.contentEntry === contentHit {
+                        let moved = cached.screenRow != screenRow
+                        let needsPlacement: Bool
+                        switch bufferingMode {
+                        case .perRowPersistent:
+                            needsPlacement = moved || cached.buffers == nil
+                        case .perFrameAggregated:
+                            needsPlacement = moved || cached.data == nil
+                        }
+                        if needsPlacement {
+                            let placeInterval = Profiling.begin(.metalRowPlace)
+                            defer { placeInterval.end() }
+                            let rowData = placeRow(contentHit.prepared,
+                                                   screenRow: screenRow,
+                                                   snapshot: snapshot,
+                                                   context: context,
+                                                   cellWidth: cellWidth,
+                                                   cellHeight: cellHeight,
+                                                   yOffset: yOffset,
+                                                   viewWidthPx: viewWidthPx,
+                                                   scale: scale)
+                            switch bufferingMode {
+                            case .perRowPersistent:
+                                cached.buffers = makeRowBuffers(from: rowData, reusing: cached.buffers)
+                                cached.data = nil
+                            case .perFrameAggregated:
+                                cached.data = rowData
+                                cached.buffers = nil
+                            }
+                            cached.screenRow = screenRow
+                            if moved {
+                                movedRows += 1
+                            }
+                        }
+                        cached.sourceGeneration = snapshotRow.sourceGeneration
+                        cached.revision = snapshotRow.revision
+                        entry = cached
+                    } else {
+                        let placeInterval = Profiling.begin(.metalRowPlace)
+                        defer { placeInterval.end() }
+                        let rowData = placeRow(contentHit.prepared,
+                                               screenRow: screenRow,
+                                               snapshot: snapshot,
+                                               context: context,
+                                               cellWidth: cellWidth,
+                                               cellHeight: cellHeight,
+                                               yOffset: yOffset,
+                                               viewWidthPx: viewWidthPx,
+                                               scale: scale)
+                        entry = RowCacheEntry(sourceGeneration: snapshotRow.sourceGeneration,
+                                              revision: snapshotRow.revision,
+                                              inputs: inputs,
+                                              prepared: contentHit.prepared,
+                                              contentEntry: contentHit,
+                                              screenRow: screenRow,
+                                              data: bufferingMode == .perFrameAggregated ? rowData : nil,
+                                              buffers: bufferingMode == .perRowPersistent
+                                                ? makeRowBuffers(from: rowData, reusing: previous?.buffers) : nil)
+                        if previous == nil || previous?.screenRow != screenRow {
+                            movedRows += 1
+                        }
+                    }
+                    cachedRows += 1
+                } else {
+                    let rowInterval = Profiling.begin(.metalRowBuild)
+                    defer { rowInterval.end() }
+                    let prepared = prepareRow(row: snapshotRow,
+                                              absoluteRow: absoluteRow,
+                                              context: context,
+                                              cellWidth: cellWidth,
+                                              cellHeight: cellHeight,
+                                              yOffset: yOffset,
+                                              scale: scale)
+                    let rowData = placeRow(prepared,
+                                           screenRow: screenRow,
+                                           snapshot: snapshot,
+                                           context: context,
+                                           cellWidth: cellWidth,
+                                           cellHeight: cellHeight,
+                                           yOffset: yOffset,
+                                           viewWidthPx: viewWidthPx,
+                                           scale: scale)
+                    let contentEntry: ContentRowCacheEntry?
+                    if let contentKey, prepared.kittyPlaceholders.isEmpty {
+                        let created = ContentRowCacheEntry(key: contentKey,
+                                                           row: snapshotRow,
+                                                           cols: context.cols,
+                                                           inputs: inputs,
+                                                           prepared: prepared,
+                                                           frame: contentCacheFrame)
+                        newlyBuiltContentEntries.append(created)
+                        contentEntry = created
+                    } else {
+                        contentEntry = nil
+                    }
+                    entry = RowCacheEntry(sourceGeneration: snapshotRow.sourceGeneration,
+                                          revision: snapshotRow.revision,
+                                          inputs: inputs,
+                                          prepared: prepared,
+                                          contentEntry: contentEntry,
+                                          screenRow: screenRow,
+                                          data: bufferingMode == .perFrameAggregated ? rowData : nil,
+                                          buffers: bufferingMode == .perRowPersistent
+                                            ? makeRowBuffers(from: rowData, reusing: previous?.buffers) : nil)
+                    rebuiltRows += 1
+                }
             }
             visibleRowCache[sourceIdentity] = entry
             if let rowBuffers = entry.buffers {
@@ -1876,6 +2118,9 @@ final class MetalTerminalRenderer {
         // An atlas change during this pass already dropped the cache, and
         // buildDrawData drops this pass's rows before it builds them again.
         rowCache = visibleRowCache
+        if !atlasInvalidatedDuringBuild, !newlyBuiltContentEntries.isEmpty {
+            insertContentRowCache(newlyBuiltContentEntries)
+        }
 #if DEBUG
         debugRowsRebuilt = rebuiltRows
         debugRowsCached = cachedRows
@@ -1936,7 +2181,8 @@ final class MetalTerminalRenderer {
                 debugRowsPlain += 1
 #endif
                 return preparePlainRow(plain, fonts: fonts, row: row, context: context,
-                                       cellWidth: cellWidth, yOffset: yOffset, scale: scale)
+                                       cellWidth: cellWidth, cellHeight: cellHeight,
+                                       yOffset: yOffset, scale: scale)
             }
         }
         let line = row.line
@@ -2331,6 +2577,7 @@ final class MetalTerminalRenderer {
                                  row: TerminalSnapshot.Row,
                                  context: SnapshotRenderContext,
                                  cellWidth: CGFloat,
+                                 cellHeight: CGFloat,
                                  yOffset: CGFloat,
                                  scale: CGFloat) -> PreparedRow {
         var prepared = PreparedRow(renderMode: row.line.renderMode)
@@ -2338,6 +2585,95 @@ final class MetalTerminalRenderer {
         let underlinePosition = context.fonts.underlinePosition()
         let underlineThickness = max(round(scale * context.fonts.underlineThickness()) / scale, 0.5)
         let decorationCellWidth = ceil(cellWidth)
+
+        if !plain.boxDrawings.isEmpty || !plain.blockElements.isEmpty || !plain.powerlineGlyphs.isEmpty {
+            let cellWidthPx = cellWidth * scale
+            let cellHeightPx = cellHeight * scale
+            let baseCellWidthPx = max(1, Int(round(cellWidthPx)))
+            let baseCellHeightPx = max(1, Int(round(cellHeightPx)))
+            let boxThicknessScale: CGFloat = 1.35
+            let minThicknessPx = max(1, Int(round(scale)))
+            let baseThicknessPx = max(minThicknessPx,
+                                      Int(round(scale * context.fonts.underlineThickness() * boxThicknessScale)))
+            let antiAliasBlocks = context.antiAliasCustomBlockGlyphs
+
+            for item in plain.boxDrawings {
+                let itemWidthPx = baseCellWidthPx
+                guard let entry = customGlyphEntry(codePoint: item.codePoint,
+                                                   cellWidthPx: itemWidthPx,
+                                                   cellHeightPx: baseCellHeightPx,
+                                                   scale: scale,
+                                                   baseThicknessPx: baseThicknessPx,
+                                                   antiAlias: false) else {
+                    continue
+                }
+                let atlasSize = Float(grayscaleAtlas.size)
+                prepared.boxDrawings.append(PreparedCustomGlyph(
+                    column: item.column,
+                    columnWidth: 1,
+                    itemWidthPx: itemWidthPx,
+                    entrySize: entry.size,
+                    codePoint: item.codePoint,
+                    u0: Float(entry.region.x) / atlasSize,
+                    v0: Float(entry.region.y) / atlasSize,
+                    u1: Float(entry.region.x + entry.region.width) / atlasSize,
+                    v1: Float(entry.region.y + entry.region.height) / atlasSize,
+                    color: colorToSIMD(item.foregroundColor)))
+            }
+
+            for element in plain.blockElements {
+                let itemWidthPx: Int
+                if antiAliasBlocks {
+                    itemWidthPx = max(1, Int(round(cellWidthPx)))
+                } else {
+                    itemWidthPx = baseCellWidthPx
+                }
+                guard let entry = customGlyphEntry(codePoint: element.codePoint,
+                                                   cellWidthPx: itemWidthPx,
+                                                   cellHeightPx: baseCellHeightPx,
+                                                   scale: scale,
+                                                   baseThicknessPx: 0,
+                                                   antiAlias: antiAliasBlocks) else {
+                    continue
+                }
+                let atlasSize = Float(grayscaleAtlas.size)
+                prepared.blockElements.append(PreparedCustomGlyph(
+                    column: element.column,
+                    columnWidth: 1,
+                    itemWidthPx: itemWidthPx,
+                    entrySize: entry.size,
+                    codePoint: element.codePoint,
+                    u0: Float(entry.region.x) / atlasSize,
+                    v0: Float(entry.region.y) / atlasSize,
+                    u1: Float(entry.region.x + entry.region.width) / atlasSize,
+                    v1: Float(entry.region.y + entry.region.height) / atlasSize,
+                    color: colorToSIMD(element.foregroundColor)))
+            }
+
+            for item in plain.powerlineGlyphs {
+                let itemWidthPx = baseCellWidthPx
+                guard let entry = customGlyphEntry(codePoint: item.codePoint,
+                                                   cellWidthPx: itemWidthPx,
+                                                   cellHeightPx: baseCellHeightPx,
+                                                   scale: scale,
+                                                   baseThicknessPx: baseThicknessPx,
+                                                   antiAlias: true) else {
+                    continue
+                }
+                let atlasSize = Float(grayscaleAtlas.size)
+                prepared.powerlineGlyphs.append(PreparedCustomGlyph(
+                    column: item.column,
+                    columnWidth: 1,
+                    itemWidthPx: itemWidthPx,
+                    entrySize: entry.size,
+                    codePoint: item.codePoint,
+                    u0: Float(entry.region.x) / atlasSize,
+                    v0: Float(entry.region.y) / atlasSize,
+                    u1: Float(entry.region.x + entry.region.width) / atlasSize,
+                    v1: Float(entry.region.y + entry.region.height) / atlasSize,
+                    color: colorToSIMD(item.foregroundColor)))
+            }
+        }
 
         for run in plain.runs {
             let style = run.style
@@ -2915,6 +3251,7 @@ final class MetalTerminalRenderer {
             glyphBitmapResultCache.removeDrawables()
             customGlyphCache.removeAll()
             rowCache.removeAll()
+            clearContentRowCache()
             atlasInvalidatedDuringBuild = true
             if ProfilingStats.enabled {
                 if atlas === colorAtlas {
@@ -2925,6 +3262,7 @@ final class MetalTerminalRenderer {
             }
         } else if atlas.size != previousSize {
             rowCache.removeAll()
+            clearContentRowCache()
             atlasInvalidatedDuringBuild = true
             if ProfilingStats.enabled {
                 if atlas === colorAtlas {

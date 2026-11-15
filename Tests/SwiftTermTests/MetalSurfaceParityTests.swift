@@ -16,8 +16,12 @@ import Foundation
 import Testing
 @testable import SwiftTerm
 
-#if os(macOS) && canImport(MetalKit)
+#if (os(macOS) || os(iOS)) && canImport(MetalKit)
+#if os(macOS)
 import AppKit
+#else
+import UIKit
+#endif
 import Metal
 import MetalKit
 import QuartzCore

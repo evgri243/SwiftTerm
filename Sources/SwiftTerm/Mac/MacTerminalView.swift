@@ -385,6 +385,9 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         didSet {
             guard oldValue != metalScaleFactorOverride else { return }
             guard useMetalRenderer else { return }
+            if let layerView = metalView as? TerminalMetalLayerView {
+                layerView.scaleOverride = metalScaleFactorOverride
+            }
             let scale = metalRenderingScaleFactor()
             metalView?.renderContentsScale = scale
             metalView?.renderDrawableSize = CGSize(width: bounds.width * scale,
@@ -443,8 +446,13 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     }
 
     func startRenderLoopIfNeeded () {
-        guard usesMetalLayerSurfaceSetting, metalView?.needsExternalDrawCall == true else {
+        guard usesMetalLayerSurfaceSetting,
+              metalView?.needsExternalDrawCall == true,
+              activeRenderLoop() == nil else {
             return
+        }
+        if let viewState = captureFrameViewState() {
+            publishFrameViewState(viewState)
         }
         let owner = renderOwner
         let applyEffects: @MainActor @Sendable (MainFrameEffects) -> Void = { [weak self] effects in
@@ -793,6 +801,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             let layerView = TerminalMetalLayerView(frame: frame)
             layerView.autoresizingMask = [.width, .height]
             layerView.renderDevice = device
+            layerView.scaleOverride = metalScaleFactorOverride
             // Same configuration the MTKView path applies below. Every one of
             // these matters and none of them show up in a pixel comparison.
             layerView.metalLayer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)

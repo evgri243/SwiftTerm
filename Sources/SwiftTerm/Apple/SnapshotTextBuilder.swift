@@ -97,10 +97,20 @@ struct PlainRun {
     let style: PlainRunStyle
 }
 
-/// A row of plain cells: the ASCII code drawn in each column and the runs.
+struct PlainShapeItem {
+    let column: Int
+    let codePoint: UInt32
+    let foregroundColor: PlainColor
+}
+
+/// A row of plain cells: the ASCII code drawn in each column, the runs, and any
+/// single-cell custom shapes whose glyph slot is drawn as a space.
 struct PlainRow {
     var codes: [UInt8]
     var runs: [PlainRun]
+    var boxDrawings: [PlainShapeItem] = []
+    var blockElements: [PlainShapeItem] = []
+    var powerlineGlyphs: [PlainShapeItem] = []
 }
 
 private struct DimmedColorKey: Hashable {
@@ -767,6 +777,13 @@ final class SnapshotTextBuilder {
     /// values, without building the dictionaries or the attributed string.
     /// The renderer shapes such runs itself when their fonts allow it
     /// (`PlainTextFont`).
+    private enum PlainShapeKind {
+        case none
+        case powerline
+        case boxDrawing
+        case blockElement
+    }
+
     func plainRow (row snapshotRow: TerminalSnapshot.Row, absoluteRow: Int,
                    context: SnapshotRenderContext) -> PlainRow?
     {
@@ -777,6 +794,9 @@ final class SnapshotTextBuilder {
         var codes: [UInt8] = []
         codes.reserveCapacity(cols)
         var runs: [PlainRun] = []
+        var boxDrawings: [PlainShapeItem] = []
+        var blockElements: [PlainShapeItem] = []
+        var powerlineGlyphs: [PlainShapeItem] = []
         var decodedStyleKey: PackedAttributeKey?
         var decodedAttribute = CharData.defaultAttr
         var lastStyleKey: PackedAttributeKey?
@@ -787,7 +807,6 @@ final class SnapshotTextBuilder {
             let cell = line.packedView(at: col)
             guard cell.width == 1, cell.isSimpleRune else { return nil }
             let code = UInt32(bitPattern: cell.code)
-            guard code == 0 || PlainTextFont.isPlain(code) else { return nil }
             let styleKey = cell.attributeKey
             let attribute: Attribute
             if decodedStyleKey == styleKey {
@@ -801,39 +820,76 @@ final class SnapshotTextBuilder {
                                              cell: cell, context: context)
             let isSelected = isColumnSelected(selectionColumns, column: col, width: 1)
             let textHidden = attribute.style.contains(.invisible) || (!context.textBlinkVisible && attribute.style.contains(.blink))
-            codes.append(textHidden || code == 0 ? 0x20 : UInt8(code))
+            let shapeKind: PlainShapeKind
+            if code == 0 || PlainTextFont.isPlain(code) {
+                shapeKind = .none
+            } else if !textHidden, context.customBlockGlyphs {
+                if PowerlineRenderer.shouldRender(codePoint: code, customGlyphsEnabled: true) {
+                    shapeKind = .powerline
+                } else if code >= UInt32(BoxDrawingRenderer.lowerBoundary),
+                          code <= UInt32(BoxDrawingRenderer.upperBoundary) {
+                    shapeKind = .boxDrawing
+                } else if code >= UInt32(BlockElementMapping.lowerBoundary),
+                          code <= UInt32(BlockElementMapping.upperBoundary),
+                          BlockElementMapping.rects(for: code) != nil {
+                    shapeKind = .blockElement
+                } else {
+                    return nil
+                }
+            } else {
+                return nil
+            }
+            codes.append(textHidden || code == 0 || shapeKind != .none ? 0x20 : UInt8(code))
             if let last = runs.indices.last, styleKey == lastStyleKey, hasUrl == lastHasUrl,
                isSelected == lastIsSelected, textHidden == lastTextHidden {
                 runs[last].end = col + 1
-                continue
-            }
-            lastStyleKey = styleKey
-            lastHasUrl = hasUrl
-            lastIsSelected = isSelected
-            lastTextHidden = textHidden
-            var style = plainStyle(attribute, withUrl: hasUrl, context: context)
-            // The same adjustments `buildAttributedString` makes to a batch.
-            if isSelected {
-                style.selectionBackground = context.selectionFillColor
-                style.foreground = .color(context.selectedTextForegroundColor)
-                style.shapeColor = .color(context.selectedTextForegroundColor)
-                style.underline?.color = .color(context.selectedTextForegroundColor)
-                if style.strikethrough != nil {
-                    style.strikethrough = .color(context.selectedTextForegroundColor)
+            } else {
+                lastStyleKey = styleKey
+                lastHasUrl = hasUrl
+                lastIsSelected = isSelected
+                lastTextHidden = textHidden
+                var style = plainStyle(attribute, withUrl: hasUrl, context: context)
+                // The same adjustments `buildAttributedString` makes to a batch.
+                if isSelected {
+                    style.selectionBackground = context.selectionFillColor
+                    style.foreground = .color(context.selectedTextForegroundColor)
+                    style.shapeColor = .color(context.selectedTextForegroundColor)
+                    style.underline?.color = .color(context.selectedTextForegroundColor)
+                    if style.strikethrough != nil {
+                        style.strikethrough = .color(context.selectedTextForegroundColor)
+                    }
+                }
+                if textHidden {
+                    style.foreground = .color(TTColor.clear)
+                    style.underline = nil
+                    style.strikethrough = nil
+                }
+                if let last = runs.indices.last, sameAttributes(runs[last].style, style, context: context) {
+                    runs[last].end = col + 1
+                } else {
+                    runs.append(PlainRun(start: col, end: col + 1, style: style))
                 }
             }
-            if textHidden {
-                style.foreground = .color(TTColor.clear)
-                style.underline = nil
-                style.strikethrough = nil
-            }
-            if let last = runs.indices.last, sameAttributes(runs[last].style, style, context: context) {
-                runs[last].end = col + 1
-            } else {
-                runs.append(PlainRun(start: col, end: col + 1, style: style))
+            if shapeKind != .none {
+                let runShapeColor = runs[runs.count - 1].style.shapeColor
+                let item = PlainShapeItem(column: col, codePoint: code, foregroundColor: runShapeColor)
+                switch shapeKind {
+                case .none:
+                    break
+                case .powerline:
+                    powerlineGlyphs.append(item)
+                case .boxDrawing:
+                    boxDrawings.append(item)
+                case .blockElement:
+                    blockElements.append(item)
+                }
             }
         }
-        return PlainRow(codes: codes, runs: runs)
+        return PlainRow(codes: codes,
+                        runs: runs,
+                        boxDrawings: boxDrawings,
+                        blockElements: blockElements,
+                        powerlineGlyphs: powerlineGlyphs)
     }
 
     /// `buildAttributes` as values.
@@ -866,6 +922,9 @@ final class SnapshotTextBuilder {
         if flags.contains(.dim) {
             foregroundColor = .color(dimmedColor(foregroundColor, towards: backgroundColor,
                                                  context: context))
+        }
+        if withUrl, let linkColor = context.linkColor {
+            foregroundColor = .color(linkColor)
         }
         let shapeColor = foregroundColor
         foregroundColor = contrastedColor(foregroundColor, against: backgroundColor, context: context)

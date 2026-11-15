@@ -225,6 +225,10 @@ private protocol FrameDisplayLinkBackend: AnyObject {
     func start()
     func stop()
     func invalidate()
+#if !os(macOS)
+    @available(iOS 15.0, tvOS 15.0, visionOS 1.0, *)
+    var preferredFrameRateRange: CAFrameRateRange { get }
+#endif
 }
 
 #if os(macOS)
@@ -262,8 +266,16 @@ private final class MobileFrameDisplayLinkBackend: FrameDisplayLinkBackend {
         link = CADisplayLink(
             target: target,
             selector: #selector(FrameDisplayLinkTarget.displayLinkFired(_:)))
+        if #available(iOS 15.0, tvOS 15.0, visionOS 1.0, *) {
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+        }
         link.isPaused = true
         link.add(to: .main, forMode: .common)
+    }
+
+    @available(iOS 15.0, tvOS 15.0, visionOS 1.0, *)
+    var preferredFrameRateRange: CAFrameRateRange {
+        link.preferredFrameRateRange
     }
 
     func start() {
@@ -406,6 +418,13 @@ final class FrameDriver {
     var currentCounters: FrameDriverCounters {
         counters
     }
+
+#if !os(macOS)
+    @available(iOS 15.0, tvOS 15.0, visionOS 1.0, *)
+    var preferredFrameRateRange: CAFrameRateRange? {
+        displayLinkBackend?.preferredFrameRateRange
+    }
+#endif
 
     func resetCounters() {
         counters = FrameDriverCounters()

@@ -73,6 +73,15 @@ final class TerminalMetalLayerView: TerminalMetalLayerViewBase {
     /// Called when the surface wants a frame — a resize, or a layer rebuild.
     /// The host decides how to service it.
     var onNeedsDisplay: (@MainActor () -> Void)?
+    /// Explicit scale from `TerminalView.metalScaleFactorOverride`, when set.
+    var scaleOverride: CGFloat? {
+        didSet {
+            guard oldValue != scaleOverride else { return }
+            if let scaleOverride, scaleOverride > 0 {
+                renderContentsScale = scaleOverride
+            }
+        }
+    }
     private var renderSurfaceStorage: TerminalMetalLayerRenderSurface!
 
 #if !os(macOS)
@@ -104,6 +113,8 @@ final class TerminalMetalLayerView: TerminalMetalLayerViewBase {
         // We repaint the whole surface every frame, so AppKit does not need to
         // preserve or redraw layer contents on resize.
         layerContentsRedrawPolicy = .onSetNeedsDisplay
+#else
+        isUserInteractionEnabled = false
 #endif
         let metal = metalLayer
         metal.pixelFormat = .bgra8Unorm
@@ -165,7 +176,10 @@ final class TerminalMetalLayerView: TerminalMetalLayerViewBase {
 
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
-        if let scale = window?.backingScaleFactor {
+        if let scaleOverride, scaleOverride > 0 {
+            renderContentsScale = scaleOverride
+            updateDrawableSize()
+        } else if let scale = window?.backingScaleFactor {
             renderContentsScale = scale
         } else {
             updateDrawableSize()
@@ -181,7 +195,12 @@ final class TerminalMetalLayerView: TerminalMetalLayerViewBase {
 #else
     override func layoutSubviews() {
         super.layoutSubviews()
-        renderContentsScale = traitCollection.displayScale
+        if let scaleOverride, scaleOverride > 0 {
+            renderContentsScale = scaleOverride
+        } else if window != nil, traitCollection.displayScale > 0 {
+            renderContentsScale = traitCollection.displayScale
+        }
+        updateDrawableSize()
         onNeedsDisplay?()
     }
 #endif

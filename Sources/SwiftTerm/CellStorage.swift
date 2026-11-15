@@ -1046,6 +1046,11 @@ final class CellStoragePage {
     }
 
     @inline(__always)
+    func withPackedCells<R>(_ body: (UnsafeBufferPointer<PackedCell>) -> R) -> R {
+        body(UnsafeBufferPointer(cells))
+    }
+
+    @inline(__always)
     func view(at index: Int) -> PackedCellView {
         PackedCellView(packed: cells[index], arena: arena)
     }

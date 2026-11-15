@@ -53,6 +53,8 @@ typealias TTFont = UIFont
 typealias TTRect = CGRect
 typealias TTBezierPath = UIBezierPath
 public typealias TTImage = UIImage
+@MainActor var voiceOverRunningForTesting: (@MainActor () -> Bool)?
+@MainActor var accessibilityLayoutChangedObserverForTesting: (@MainActor () -> Void)?
 #endif
 
 #if os(macOS)
@@ -568,7 +570,11 @@ struct FrameViewState: Sendable {
         fontSmoothing = view.fontSmoothing
         cursorHasFocus = !view.caretViewTracksFocus || view.hasFocus
 #else
+#if canImport(MetalKit)
+        renderingScale = view.metalRenderingScaleFactor()
+#else
         renderingScale = view.backingScaleFactor()
+#endif
         fontSmoothing = true
         cursorHasFocus = !view.caretViewTracksFocus || view.isFirstResponder
 #endif
@@ -1273,6 +1279,7 @@ public final class TerminalInputSender: Sendable {
 public final class TerminalFeedSender: Sendable {
     private struct State: Sendable {
         var feedBytes: (@Sendable ([UInt8]) -> Void)?
+        var feedBorrowed: (@Sendable (UnsafeRawBufferPointer) -> Void)?
         var feedText: (@Sendable (String) -> Void)?
     }
 
@@ -1281,10 +1288,12 @@ public final class TerminalFeedSender: Sendable {
     @MainActor
     fileprivate func configure(
         feedBytes: @escaping @Sendable ([UInt8]) -> Void,
+        feedBorrowed: @escaping @Sendable (UnsafeRawBufferPointer) -> Void,
         feedText: @escaping @Sendable (String) -> Void
     ) {
         state.withLock { state in
             state.feedBytes = feedBytes
+            state.feedBorrowed = feedBorrowed
             state.feedText = feedText
         }
     }
@@ -1292,6 +1301,19 @@ public final class TerminalFeedSender: Sendable {
     public func feed(byteArray: ArraySlice<UInt8>) {
         let bytes = Array(byteArray)
         state.withLock { $0.feedBytes }?(bytes)
+    }
+
+    /// Synchronously feeds borrowed raw bytes without copying them into an array.
+    /// The underlying memory is not retained after this method returns.
+    public func feed(buffer: UnsafeRawBufferPointer) {
+        state.withLock { $0.feedBorrowed }?(buffer)
+    }
+
+    /// Synchronously feeds `Data` without copying contiguous storage into `[UInt8]`.
+    public func feed(data: Data) {
+        data.withUnsafeBytes { rawBuffer in
+            state.withLock { $0.feedBorrowed }?(rawBuffer)
+        }
     }
 
     public func feed(text: String) {
@@ -1517,6 +1539,21 @@ extension TerminalView {
                 parse.end()
                 diagnosticsState.withLock { diagnostics in
                     diagnostics.bytesFed += bytes.count
+                    diagnostics.batches += 1
+                }
+                signal.markDirty()
+            },
+            feedBorrowed: { rawBuffer in
+                guard !rawBuffer.isEmpty else { return }
+                signal.markDirty()
+                let parse = Profiling.begin(.ioParse, "bytes=%d", rawBuffer.count)
+                rawBuffer.withMemoryRebound(to: UInt8.self) { typed in
+                    let span = unsafe typed.span
+                    _ = owner.feed(borrowedBytes: span)
+                }
+                parse.end()
+                diagnosticsState.withLock { diagnostics in
+                    diagnostics.bytesFed += rawBuffer.count
                     diagnostics.batches += 1
                 }
                 signal.markDirty()
@@ -4050,7 +4087,7 @@ extension TerminalView {
         let tick = Profiling.begin(.frameTick)
         defer { tick.end() }
         guard let viewState = captureFrameViewState() else { return }
-#if os(macOS) && canImport(MetalKit)
+#if canImport(MetalKit)
         if usesRenderLoop {
             publishFrameViewState(viewState)
             renderLoop?.signal()
@@ -4126,7 +4163,10 @@ extension TerminalView {
         if effects.notifyAccessibility {
             accessibility.invalidate()
 #if os(iOS)
-            UIAccessibility.post(notification: .layoutChanged, argument: nil)
+            if voiceOverRunningForTesting?() ?? UIAccessibility.isVoiceOverRunning {
+                accessibilityLayoutChangedObserverForTesting?()
+                UIAccessibility.post(notification: .layoutChanged, argument: nil)
+            }
 #endif
 #if os(macOS)
             NSAccessibility.post(element: self, notification: .valueChanged)
@@ -4291,12 +4331,15 @@ extension TerminalView {
     /// each tick carried the 6 ms draw.
     func requestImmediateFrame ()
     {
-#if os(macOS) && canImport(MetalKit)
+#if canImport(MetalKit)
         // Not while nothing can see the terminal: signalling the loop bypasses
         // the display link, which is where the occlusion pause lives, so this
         // is the one path that could keep a render thread drawing into an
         // occluded window (io-gaps.md G8b).
         if let loop = activeRenderLoop(), frameDriver?.isVisibilitySuspended != true {
+            if let viewState = captureFrameViewState() {
+                publishFrameViewState(viewState)
+            }
             frameDriver?.markDirty()
             loop.signal()
             return
@@ -4437,7 +4480,7 @@ extension TerminalView {
             result.atlasInvalidationBuildAttempts = counters.atlasInvalidationBuildAttempts
         }
 #endif
-#if os(macOS) && canImport(MetalKit)
+#if canImport(MetalKit)
         if let loopCounters = renderLoop?.currentCounters {
             result.renderLoopFrames = loopCounters.frames
             result.renderLoopCoalesced = loopCounters.coalesced
@@ -4453,8 +4496,6 @@ extension TerminalView {
         frameDriver?.resetCounters()
 #if canImport(MetalKit)
         renderOwner.resetMetalCounters()
-#endif
-#if os(macOS) && canImport(MetalKit)
         renderLoop?.resetCounters()
 #endif
     }
@@ -4733,6 +4774,20 @@ extension TerminalView {
     public nonisolated func feed (byteArray: ArraySlice<UInt8>)
     {
         feedSender.feed(byteArray: byteArray)
+    }
+
+    /// Synchronously feeds borrowed raw bytes without copying them into an array.
+    /// Safe to invoke from any thread; the underlying memory is not retained after return.
+    public nonisolated func feed (buffer: UnsafeRawBufferPointer)
+    {
+        feedSender.feed(buffer: buffer)
+    }
+
+    /// Synchronously feeds `Data` without allocating an intermediate `[UInt8]` copy.
+    /// Safe to invoke from any thread.
+    public nonisolated func feed (data: Data)
+    {
+        feedSender.feed(data: data)
     }
     
     /// Sends data to the terminal emulator for interpretation, this can be invoked from a background thread

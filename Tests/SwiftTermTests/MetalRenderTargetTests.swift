@@ -10,7 +10,7 @@ import Foundation
 import Testing
 @testable import SwiftTerm
 
-#if os(macOS) && canImport(Metal)
+#if (os(macOS) || os(iOS)) && canImport(Metal)
 import Metal
 import QuartzCore
 
