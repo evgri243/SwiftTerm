@@ -401,6 +401,22 @@ struct RowDrawBuffers {
     var otherImageBuffers: [ImageDrawBuffer]
 }
 
+/// The per-row sizes of the custom glyphs, in device pixels.
+private struct CustomGlyphRowLayout {
+    let scale: CGFloat
+    let cellWidthPx: CGFloat
+    let baseCellWidthPx: Int
+    let baseCellHeightPx: Int
+    let baseThicknessPx: Int
+    let antiAliasBlocks: Bool
+}
+
+private enum CustomGlyphShape {
+    case boxDrawing
+    case block
+    case powerline
+}
+
 /// A box drawing, block element or Powerline cell with its atlas entry and
 /// color resolved.
 struct PreparedCustomGlyph {
@@ -2198,96 +2214,33 @@ final class MetalTerminalRenderer {
         let shapeInterval = Profiling.begin(.rowShape)
         let shapedSegments = buildShapedSegments(lineInfo.segments, context: context)
         shapeInterval.end()
-        let cellWidthPx = cellWidth * scale
-        let cellHeightPx = cellHeight * scale
-        let baseCellWidthPx = max(1, Int(round(cellWidthPx)))
-        let baseCellHeightPx = max(1, Int(round(cellHeightPx)))
         let underlinePosition = context.fonts.underlinePosition()
         let underlineThickness = max(round(scale * context.fonts.underlineThickness()) / scale, 0.5)
         let decorationCellWidth = ceil(cellWidth)
 
         if !lineInfo.boxDrawings.isEmpty || !lineInfo.blockElements.isEmpty || !lineInfo.powerlineGlyphs.isEmpty {
-            let boxThicknessScale: CGFloat = 1.35
-            let minThicknessPx = max(1, Int(round(scale)))
-            let baseThicknessPx = max(minThicknessPx,
-                                      Int(round(scale * context.fonts.underlineThickness() * boxThicknessScale)))
-            let antiAliasBlocks = context.antiAliasCustomBlockGlyphs
-
+            let layout = customGlyphRowLayout(cellWidth: cellWidth, cellHeight: cellHeight,
+                                              scale: scale, context: context)
             for item in lineInfo.boxDrawings {
-                let itemWidthPx = baseCellWidthPx * item.columnWidth
-                guard let entry = customGlyphEntry(codePoint: item.codePoint,
-                                                   cellWidthPx: itemWidthPx,
-                                                   cellHeightPx: baseCellHeightPx,
-                                                   scale: scale,
-                                                   baseThicknessPx: baseThicknessPx,
-                                                   antiAlias: false) else {
-                    continue
+                if let glyph = preparedCustomGlyph(shape: .boxDrawing, codePoint: item.codePoint,
+                                                   column: item.column, columnWidth: item.columnWidth,
+                                                   color: colorToSIMD(item.foregroundColor), layout: layout) {
+                    prepared.boxDrawings.append(glyph)
                 }
-                let atlasSize = Float(grayscaleAtlas.size)
-                prepared.boxDrawings.append(PreparedCustomGlyph(
-                    column: item.column,
-                    columnWidth: item.columnWidth,
-                    itemWidthPx: itemWidthPx,
-                    entrySize: entry.size,
-                    codePoint: item.codePoint,
-                    u0: Float(entry.region.x) / atlasSize,
-                    v0: Float(entry.region.y) / atlasSize,
-                    u1: Float(entry.region.x + entry.region.width) / atlasSize,
-                    v1: Float(entry.region.y + entry.region.height) / atlasSize,
-                    color: colorToSIMD(item.foregroundColor)))
             }
-
             for element in lineInfo.blockElements {
-                let itemWidthPx: Int
-                if antiAliasBlocks {
-                    itemWidthPx = max(1, Int(round(cellWidthPx * CGFloat(element.columnWidth))))
-                } else {
-                    itemWidthPx = baseCellWidthPx * element.columnWidth
+                if let glyph = preparedCustomGlyph(shape: .block, codePoint: element.codePoint,
+                                                   column: element.column, columnWidth: element.columnWidth,
+                                                   color: colorToSIMD(element.foregroundColor), layout: layout) {
+                    prepared.blockElements.append(glyph)
                 }
-                guard let entry = customGlyphEntry(codePoint: element.codePoint,
-                                                   cellWidthPx: itemWidthPx,
-                                                   cellHeightPx: baseCellHeightPx,
-                                                   scale: scale,
-                                                   baseThicknessPx: 0,
-                                                   antiAlias: antiAliasBlocks) else {
-                    continue
-                }
-                let atlasSize = Float(grayscaleAtlas.size)
-                prepared.blockElements.append(PreparedCustomGlyph(
-                    column: element.column,
-                    columnWidth: element.columnWidth,
-                    itemWidthPx: itemWidthPx,
-                    entrySize: entry.size,
-                    codePoint: element.codePoint,
-                    u0: Float(entry.region.x) / atlasSize,
-                    v0: Float(entry.region.y) / atlasSize,
-                    u1: Float(entry.region.x + entry.region.width) / atlasSize,
-                    v1: Float(entry.region.y + entry.region.height) / atlasSize,
-                    color: colorToSIMD(element.foregroundColor)))
             }
-
             for item in lineInfo.powerlineGlyphs {
-                let itemWidthPx = baseCellWidthPx * item.columnWidth
-                guard let entry = customGlyphEntry(codePoint: item.codePoint,
-                                                   cellWidthPx: itemWidthPx,
-                                                   cellHeightPx: baseCellHeightPx,
-                                                   scale: scale,
-                                                   baseThicknessPx: baseThicknessPx,
-                                                   antiAlias: true) else {
-                    continue
+                if let glyph = preparedCustomGlyph(shape: .powerline, codePoint: item.codePoint,
+                                                   column: item.column, columnWidth: item.columnWidth,
+                                                   color: colorToSIMD(item.foregroundColor), layout: layout) {
+                    prepared.powerlineGlyphs.append(glyph)
                 }
-                let atlasSize = Float(grayscaleAtlas.size)
-                prepared.powerlineGlyphs.append(PreparedCustomGlyph(
-                    column: item.column,
-                    columnWidth: item.columnWidth,
-                    itemWidthPx: itemWidthPx,
-                    entrySize: entry.size,
-                    codePoint: item.codePoint,
-                    u0: Float(entry.region.x) / atlasSize,
-                    v0: Float(entry.region.y) / atlasSize,
-                    u1: Float(entry.region.x + entry.region.width) / atlasSize,
-                    v1: Float(entry.region.y + entry.region.height) / atlasSize,
-                    color: colorToSIMD(item.foregroundColor)))
             }
         }
 
@@ -2587,91 +2540,28 @@ final class MetalTerminalRenderer {
         let decorationCellWidth = ceil(cellWidth)
 
         if !plain.boxDrawings.isEmpty || !plain.blockElements.isEmpty || !plain.powerlineGlyphs.isEmpty {
-            let cellWidthPx = cellWidth * scale
-            let cellHeightPx = cellHeight * scale
-            let baseCellWidthPx = max(1, Int(round(cellWidthPx)))
-            let baseCellHeightPx = max(1, Int(round(cellHeightPx)))
-            let boxThicknessScale: CGFloat = 1.35
-            let minThicknessPx = max(1, Int(round(scale)))
-            let baseThicknessPx = max(minThicknessPx,
-                                      Int(round(scale * context.fonts.underlineThickness() * boxThicknessScale)))
-            let antiAliasBlocks = context.antiAliasCustomBlockGlyphs
-
+            let layout = customGlyphRowLayout(cellWidth: cellWidth, cellHeight: cellHeight,
+                                              scale: scale, context: context)
             for item in plain.boxDrawings {
-                let itemWidthPx = baseCellWidthPx
-                guard let entry = customGlyphEntry(codePoint: item.codePoint,
-                                                   cellWidthPx: itemWidthPx,
-                                                   cellHeightPx: baseCellHeightPx,
-                                                   scale: scale,
-                                                   baseThicknessPx: baseThicknessPx,
-                                                   antiAlias: false) else {
-                    continue
+                if let glyph = preparedCustomGlyph(shape: .boxDrawing, codePoint: item.codePoint,
+                                                   column: item.column, columnWidth: 1,
+                                                   color: colorToSIMD(item.foregroundColor), layout: layout) {
+                    prepared.boxDrawings.append(glyph)
                 }
-                let atlasSize = Float(grayscaleAtlas.size)
-                prepared.boxDrawings.append(PreparedCustomGlyph(
-                    column: item.column,
-                    columnWidth: 1,
-                    itemWidthPx: itemWidthPx,
-                    entrySize: entry.size,
-                    codePoint: item.codePoint,
-                    u0: Float(entry.region.x) / atlasSize,
-                    v0: Float(entry.region.y) / atlasSize,
-                    u1: Float(entry.region.x + entry.region.width) / atlasSize,
-                    v1: Float(entry.region.y + entry.region.height) / atlasSize,
-                    color: colorToSIMD(item.foregroundColor)))
             }
-
             for element in plain.blockElements {
-                let itemWidthPx: Int
-                if antiAliasBlocks {
-                    itemWidthPx = max(1, Int(round(cellWidthPx)))
-                } else {
-                    itemWidthPx = baseCellWidthPx
+                if let glyph = preparedCustomGlyph(shape: .block, codePoint: element.codePoint,
+                                                   column: element.column, columnWidth: 1,
+                                                   color: colorToSIMD(element.foregroundColor), layout: layout) {
+                    prepared.blockElements.append(glyph)
                 }
-                guard let entry = customGlyphEntry(codePoint: element.codePoint,
-                                                   cellWidthPx: itemWidthPx,
-                                                   cellHeightPx: baseCellHeightPx,
-                                                   scale: scale,
-                                                   baseThicknessPx: 0,
-                                                   antiAlias: antiAliasBlocks) else {
-                    continue
-                }
-                let atlasSize = Float(grayscaleAtlas.size)
-                prepared.blockElements.append(PreparedCustomGlyph(
-                    column: element.column,
-                    columnWidth: 1,
-                    itemWidthPx: itemWidthPx,
-                    entrySize: entry.size,
-                    codePoint: element.codePoint,
-                    u0: Float(entry.region.x) / atlasSize,
-                    v0: Float(entry.region.y) / atlasSize,
-                    u1: Float(entry.region.x + entry.region.width) / atlasSize,
-                    v1: Float(entry.region.y + entry.region.height) / atlasSize,
-                    color: colorToSIMD(element.foregroundColor)))
             }
-
             for item in plain.powerlineGlyphs {
-                let itemWidthPx = baseCellWidthPx
-                guard let entry = customGlyphEntry(codePoint: item.codePoint,
-                                                   cellWidthPx: itemWidthPx,
-                                                   cellHeightPx: baseCellHeightPx,
-                                                   scale: scale,
-                                                   baseThicknessPx: baseThicknessPx,
-                                                   antiAlias: true) else {
-                    continue
+                if let glyph = preparedCustomGlyph(shape: .powerline, codePoint: item.codePoint,
+                                                   column: item.column, columnWidth: 1,
+                                                   color: colorToSIMD(item.foregroundColor), layout: layout) {
+                    prepared.powerlineGlyphs.append(glyph)
                 }
-                let atlasSize = Float(grayscaleAtlas.size)
-                prepared.powerlineGlyphs.append(PreparedCustomGlyph(
-                    column: item.column,
-                    columnWidth: 1,
-                    itemWidthPx: itemWidthPx,
-                    entrySize: entry.size,
-                    codePoint: item.codePoint,
-                    u0: Float(entry.region.x) / atlasSize,
-                    v0: Float(entry.region.y) / atlasSize,
-                    u1: Float(entry.region.x + entry.region.width) / atlasSize,
-                    v1: Float(entry.region.y + entry.region.height) / atlasSize,
-                    color: colorToSIMD(item.foregroundColor)))
             }
         }
 
@@ -3590,6 +3480,73 @@ final class MetalTerminalRenderer {
                       y: minY,
                       width: max(0, maxX - minX),
                       height: max(0, maxY - minY))
+    }
+
+    /// Custom glyph geometry for one row. `prepareRow` and `preparePlainRow` both
+    /// build it here, so the shaped and plain paths cannot drift apart.
+    private func customGlyphRowLayout(cellWidth: CGFloat,
+                                      cellHeight: CGFloat,
+                                      scale: CGFloat,
+                                      context: SnapshotRenderContext) -> CustomGlyphRowLayout {
+        let cellWidthPx = cellWidth * scale
+        let cellHeightPx = cellHeight * scale
+        let boxThicknessScale: CGFloat = 1.35
+        let minThicknessPx = max(1, Int(round(scale)))
+        return CustomGlyphRowLayout(
+            scale: scale,
+            cellWidthPx: cellWidthPx,
+            baseCellWidthPx: max(1, Int(round(cellWidthPx))),
+            baseCellHeightPx: max(1, Int(round(cellHeightPx))),
+            baseThicknessPx: max(minThicknessPx,
+                                 Int(round(scale * context.fonts.underlineThickness() * boxThicknessScale))),
+            antiAliasBlocks: context.antiAliasCustomBlockGlyphs)
+    }
+
+    private func preparedCustomGlyph(shape: CustomGlyphShape,
+                                     codePoint: UInt32,
+                                     column: Int,
+                                     columnWidth: Int,
+                                     color: SIMD4<Float>,
+                                     layout: CustomGlyphRowLayout) -> PreparedCustomGlyph? {
+        let itemWidthPx: Int
+        let baseThicknessPx: Int
+        let antiAlias: Bool
+        switch shape {
+        case .boxDrawing:
+            itemWidthPx = layout.baseCellWidthPx * columnWidth
+            baseThicknessPx = layout.baseThicknessPx
+            antiAlias = false
+        case .block:
+            itemWidthPx = layout.antiAliasBlocks
+                ? max(1, Int(round(layout.cellWidthPx * CGFloat(columnWidth))))
+                : layout.baseCellWidthPx * columnWidth
+            baseThicknessPx = 0
+            antiAlias = layout.antiAliasBlocks
+        case .powerline:
+            itemWidthPx = layout.baseCellWidthPx * columnWidth
+            baseThicknessPx = layout.baseThicknessPx
+            antiAlias = true
+        }
+        guard let entry = customGlyphEntry(codePoint: codePoint,
+                                           cellWidthPx: itemWidthPx,
+                                           cellHeightPx: layout.baseCellHeightPx,
+                                           scale: layout.scale,
+                                           baseThicknessPx: baseThicknessPx,
+                                           antiAlias: antiAlias) else {
+            return nil
+        }
+        let atlasSize = Float(grayscaleAtlas.size)
+        return PreparedCustomGlyph(
+            column: column,
+            columnWidth: columnWidth,
+            itemWidthPx: itemWidthPx,
+            entrySize: entry.size,
+            codePoint: codePoint,
+            u0: Float(entry.region.x) / atlasSize,
+            v0: Float(entry.region.y) / atlasSize,
+            u1: Float(entry.region.x + entry.region.width) / atlasSize,
+            v1: Float(entry.region.y + entry.region.height) / atlasSize,
+            color: color)
     }
 
     private func customGlyphEntry(codePoint: UInt32,

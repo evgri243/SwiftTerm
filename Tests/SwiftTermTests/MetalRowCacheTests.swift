@@ -471,6 +471,70 @@ struct MetalRowCacheTests {
         await expectParity(harness, with: finalFrame)
     }
 
+    /// A combining mark is the only difference between two rows of the same
+    /// width. Rewriting the row with its twin's mark rebuilds it, and rewriting
+    /// it back draws the first row again, exactly.
+    @Test(.enabled(if: MetalRowCacheTests.metalIsUsable)) func combiningMarkOnlyDifferenceRebuildsTheRow() async throws {
+        let harness = try #require(Harness())
+        let rows = harness.screenRows
+        let accent = "row a e\u{301}x"
+        let twin = "row a e\u{302}x"
+        fill(harness, lines: [accent], count: rows)
+        let before = try #require(await harness.frame())
+
+        func rewriteRow(_ text: String) async throws -> DrawnFrame {
+            harness.view.feed(text: "\u{1b}[3;1H\u{1b}[2K2 " + text)
+            return try #require(await harness.frame())
+        }
+
+        let mark = try await rewriteRow(twin)
+        #expect(mark.rebuilt == 1)
+        #expect(mark.moved == 0)
+        #expect(mark.rows[2] != before.rows[2])
+        #expect(mark.rows[1] == before.rows[1])
+        await expectParity(harness, with: mark)
+
+        let restored = try await rewriteRow(accent)
+        #expect(restored.rebuilt <= 1)
+        #expect(restored.rows[2] == before.rows[2])
+        await expectParity(harness, with: restored)
+    }
+
+    /// One SGR attribute is the only difference between rows of the same text.
+    /// Each variant rebuilds its row and draws differently from the one before;
+    /// plain text again draws the first row exactly.
+    @Test(.enabled(if: MetalRowCacheTests.metalIsUsable)) func oneAttributeDifferenceRebuildsTheRow() async throws {
+        let harness = try #require(Harness())
+        let rows = harness.screenRows
+        let plain = "row b shared"
+        let variants = [
+            "\u{1b}[38;2;10;200;30m" + plain + "\u{1b}[0m",
+            "\u{1b}[38;2;10;200;31m" + plain + "\u{1b}[0m",
+            "\u{1b}[1m" + plain + "\u{1b}[0m",
+        ]
+        fill(harness, lines: [plain], count: rows)
+        let before = try #require(await harness.frame())
+
+        func rewriteRow(_ text: String) async throws -> DrawnFrame {
+            harness.view.feed(text: "\u{1b}[3;1H\u{1b}[2K2 " + text)
+            return try #require(await harness.frame())
+        }
+
+        var previous = before
+        for variant in variants {
+            let frame = try await rewriteRow(variant)
+            #expect(frame.rebuilt == 1)
+            #expect(frame.rows[2] != previous.rows[2])
+            await expectParity(harness, with: frame)
+            previous = frame
+        }
+
+        let back = try await rewriteRow(plain)
+        #expect(back.rebuilt <= 1)
+        #expect(back.rows[2] == before.rows[2])
+        await expectParity(harness, with: back)
+    }
+
     /// DEC double-width and double-height lines place with a clip rectangle
     /// and a pivot that move with the row.
     @Test(.enabled(if: MetalRowCacheTests.metalIsUsable)) func decLineSizesMoveExactly() async throws {
