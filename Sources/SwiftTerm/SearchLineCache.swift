@@ -81,8 +81,10 @@ final class SearchLineCache {
 
             if lineWrapsToNext, let nextLine {
                 let lastIndex = max(line.count - 1, 0)
+                // A zero-width null cell is the second half of a wide glyph that
+                // fills the row, not the filler left before a wrapped wide glyph.
                 let lastCellIsNull = line.packedCode(at: lastIndex) == 0 &&
-                    line.packedWidth(at: lastIndex) <= 1
+                    line.packedWidth(at: lastIndex) == 1
                 if lastCellIsNull && nextLine.getWidth(index: 0) == 2 {
                     if !string.isEmpty {
                         string.removeLast()

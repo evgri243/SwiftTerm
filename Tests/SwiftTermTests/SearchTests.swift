@@ -396,4 +396,39 @@ final class SearchTests {
         _ = service.findNext(term: "")
         #expect(service.lastResult == nil)
     }
+
+    @Test func testSearchEngineFindsWideGlyphsAcrossWrappedRows() {
+        let terminal = makeTerminal(cols: 10, rows: 5)
+        let cache = SearchLineCache(terminal: terminal)
+        let engine = SearchEngine(terminal: terminal, lineCache: cache)
+
+        terminal.feed(text: String(repeating: "x", count: 8) + "日🙂needle")
+
+        let result = engine.find(term: "日🙂needle", startRow: 0, startCol: 0)
+        #expect(result == SearchResult(term: "日🙂needle", col: 8, row: 0, size: 10))
+    }
+
+    @Test func testSearchEngineFindsWideGlyphsFedByteByByteAcrossWrappedRows() {
+        let terminal = makeTerminal(cols: 10, rows: 5)
+        let cache = SearchLineCache(terminal: terminal)
+        let engine = SearchEngine(terminal: terminal, lineCache: cache)
+
+        for byte in Array((String(repeating: "x", count: 8) + "日🙂needle").utf8) {
+            terminal.feed(byteArray: [byte])
+        }
+
+        let result = engine.find(term: "日🙂needle", startRow: 0, startCol: 0)
+        #expect(result == SearchResult(term: "日🙂needle", col: 8, row: 0, size: 10))
+    }
+
+    @Test func testSearchEngineFindsGlyphAfterWrappedWidePair() {
+        let terminal = makeTerminal(cols: 10, rows: 5)
+        let cache = SearchLineCache(terminal: terminal)
+        let engine = SearchEngine(terminal: terminal, lineCache: cache)
+
+        terminal.feed(text: String(repeating: "x", count: 8) + "日🙂needle")
+
+        let result = engine.find(term: "needle", startRow: 0, startCol: 0)
+        #expect(result == SearchResult(term: "needle", col: 2, row: 1, size: 6))
+    }
 }
