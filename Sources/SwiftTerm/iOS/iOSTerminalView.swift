@@ -222,6 +222,36 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         }
     }
 
+    /**
+     * When true the host owns input routing. The view disables its stock tap, double-tap,
+     * triple-tap, long-press, one-finger mouse pan, selection pan and pointer-wheel
+     * recognizers, and never turns them back on when the mouse mode or buffer changes.
+     * Local vertical scrolling of the scroll view and the selection rendering stay active.
+     * The host then drives the view through ``sendHostMouse(action:button:modifiers:at:)``,
+     * ``selectWord(at:)``, ``beginSelection(at:)``, ``extendSelection(to:)`` and the handle
+     * methods. Defaults to false.
+     */
+    public var usesCustomInputGestures: Bool = false {
+        didSet {
+            guard usesCustomInputGestures != oldValue else { return }
+            for gesture in stockInputGestures {
+                gesture.isEnabled = !usesCustomInputGestures
+            }
+            if usesCustomInputGestures {
+                disableMousePanGesture()
+                disableSelectionPanGesture()
+                pointerScrollAccumulator.reset()
+                wheelDragAccumulator.reset()
+            } else if terminal != nil {
+                refreshProgramScrollGesture()
+                if withTerminal({ _ in selection.active }) {
+                    enableSelectionPanGesture()
+                }
+            }
+        }
+    }
+    private var stockInputGestures: [UIGestureRecognizer] = []
+
     /// Controls how link tracking resolves hovered links:
     /// `.explicit` = OSC 8 only, `.implicit` = explicit + implicit fallback, `.none` = off.
     public var linkReporting: LinkReporting = .implicit
@@ -965,6 +995,128 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         controlModifier = false
     }
 
+    /// The mouse tracking mode the running application requested, read under the terminal lock.
+    public var hostMouseMode: Terminal.MouseMode {
+        withTerminal { $0.mouseMode }
+    }
+
+    /// The size of one terminal cell in points, read under the terminal lock.
+    public var hostCellSize: CGSize {
+        withTerminal { _ in CGSize(width: cellDimension.width, height: cellDimension.height) }
+    }
+
+    /// Encodes one mouse event at a point in this view's coordinates through the terminal's
+    /// capability-based encoder. Returns whether the running application requested the event.
+    /// The point maps to the logical screen cell and the pixel position the same way as taps.
+    @discardableResult
+    public func sendHostMouse(action: TerminalMouseAction,
+                              button: TerminalMouseButton,
+                              modifiers: UInt32,
+                              at point: CGPoint) -> Bool {
+        let sent = withTerminal { terminal -> Bool in
+            let hit = calculateTapHitLocked(point: point)
+            guard let grid = hit.grid.toScreenCoordinate(from: terminal.displayBuffer),
+                  grid.row < terminal.rows else {
+                return false
+            }
+            return terminal.sendHostMouse(action: action,
+                                          button: button,
+                                          modifiers: modifiers,
+                                          col: grid.col,
+                                          row: grid.row,
+                                          pixelX: hit.pixels.col,
+                                          pixelY: hit.pixels.row)
+        }
+        if sent {
+            frameDriver.markDirty()
+        }
+        return sent
+    }
+
+    /// Selects the word or expression at a point, locally, and shows the selection menu.
+    /// Nothing is sent to the application and the keyboard is not touched.
+    public func selectWord(at point: CGPoint) {
+        let hit = calculateTapHit(point: point).grid
+        withTerminal { terminal in
+            selection.selectWordOrExpression(at: hit, in: terminal.displayBuffer)
+            selection.selectionMode = .character
+        }
+        enableSelectionPanGesture()
+        showContextMenu(forRegion: makeContextMenuRegionForSelection(), pos: hit)
+        frameDriver.markDirty()
+    }
+
+    /// Starts a character selection at a point.
+    public func beginSelection(at point: CGPoint) {
+        let hit = calculateTapHit(point: point).grid
+        withTerminal { terminal in
+            selection.startSelection(row: hit.row - terminal.displayBuffer.yDisp, col: hit.col)
+        }
+        enableSelectionPanGesture()
+        requestDisplay()
+    }
+
+    /// Extends the selection that ``beginSelection(at:)`` started to a point.
+    public func extendSelection(to point: CGPoint) {
+        let hit = calculateTapHit(point: point).grid
+        withTerminal { _ in
+            if selection.active {
+                selection.dragExtend(bufferPosition: hit)
+            }
+        }
+        requestDisplay()
+    }
+
+    /// Starts dragging a selection handle when the point is on one. Returns whether it did.
+    @discardableResult
+    public func beginSelectionHandle(at point: CGPoint) -> Bool {
+        let hit = calculateTapHit(point: point).grid
+        let started = beginSelectionHandleDrag(at: hit)
+        if started {
+            requestDisplay()
+        }
+        return started
+    }
+
+    /// Moves the selection handle that ``beginSelectionHandle(at:)`` picked up.
+    public func extendSelectionHandle(to point: CGPoint) {
+        let hit = calculateTapHit(point: point).grid
+        withTerminal { _ in
+            if selection.active {
+                selection.pivotExtend(bufferPosition: hit)
+            }
+        }
+        requestDisplay()
+    }
+
+    /// Ends a host-driven selection gesture and shows the selection menu when one is active.
+    public func endHostSelection() {
+        stopSelectionTimer()
+        if withTerminal({ _ in selection.active }) {
+            showContextMenu(forRegion: makeContextMenuRegionForSelection(),
+                            pos: withTerminal { _ in selection.end })
+        }
+    }
+
+    /// Picks up the handle near a buffer position, as the stock selection pan does.
+    func beginSelectionHandleDrag(at hit: Position) -> Bool {
+        func near(_ pos1: Position, _ pos2: Position) -> Bool {
+            abs(pos1.col - pos2.col) < 3 && abs(pos1.row - pos2.row) < 2
+        }
+        return withTerminal { _ -> Bool in
+            guard selection.active else { return false }
+            if near(selection.start, hit) {
+                selection.pivot = selection.end
+            } else if near(selection.end, hit) {
+                selection.pivot = selection.start
+            } else {
+                return false
+            }
+            selection.pivotExtend(bufferPosition: hit)
+            return true
+        }
+    }
+
     /// Reports a complete primary-button click at a point and returns whether the running
     /// application requested it.
     @discardableResult
@@ -1396,31 +1548,10 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     var panTask: Task<(),Never>?
     
     @objc func panSelectionHandler (_ gestureRecognizer: UIPanGestureRecognizer) {
-        func near (_ pos1: Position, _ pos2: Position) -> Bool {
-            return abs (pos1.col-pos2.col) < 3 && abs (pos1.row-pos2.row) < 2
-        }
-        
         switch gestureRecognizer.state {
         case .began:
             let hit = calculateTapHit(gesture: gestureRecognizer).grid
-            let extended = withTerminal { _ -> Bool in
-                if selection.active {
-                    var extend = false
-                    if near (selection.start, hit) {
-                        selection.pivot = selection.end
-                        extend = true
-                    } else if near (selection.end, hit) {
-                        selection.pivot = selection.start
-                        extend = true
-                    }
-                    if extend {
-                        selection.pivotExtend(bufferPosition: hit)
-                        return true
-                    }
-                }
-                return false
-            }
-            if extended {
+            if beginSelectionHandleDrag(at: hit) {
                 requestDisplay()
                 break
             }
@@ -1468,7 +1599,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     
     var panMouseGesture: UIPanGestureRecognizer?
     func enableMousePanGesture () {
-        guard panMouseGesture == nil else {
+        guard panMouseGesture == nil, !usesCustomInputGestures else {
             return
         }
         let gesture = UIPanGestureRecognizer (target: self, action: #selector(panMouseHandler))
@@ -1489,7 +1620,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     
     var panSelectionGesture: UIPanGestureRecognizer?
     func enableSelectionPanGesture () {
-        guard panSelectionGesture == nil else {
+        guard panSelectionGesture == nil, !usesCustomInputGestures else {
             return
         }
         let gesture = UIPanGestureRecognizer (target: self, action: #selector(panSelectionHandler))
@@ -1524,6 +1655,10 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 
         singleTap.require(toFail: doubleTap)
         doubleTap.require(toFail: tripleTap)
+        for gesture in [longPress, singleTap, doubleTap, tripleTap] as [UIGestureRecognizer] {
+            gesture.isEnabled = !usesCustomInputGestures
+            stockInputGestures.append(gesture)
+        }
     }
 
     func setupLinkReportingInteractions ()
@@ -1535,6 +1670,8 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             scroll.allowedScrollTypesMask = scrollType
             scroll.allowedTouchTypes = []
             scroll.delegate = scrollDelegate
+            scroll.isEnabled = !usesCustomInputGestures
+            stockInputGestures.append(scroll)
             addGestureRecognizer(scroll)
             // The application gets pointer scrolls first. Rejected gestures scroll locally.
             panGestureRecognizer.require(toFail: scroll)
