@@ -239,4 +239,32 @@ final class SmartWordSelectionTests: TerminalDelegate {
         selection.dragExtend(bufferPosition: Position(col: 0, row: 2))
         #expect(selection.end == Position(col: 9, row: 2))
     }
+
+    // MARK: Words across soft wraps
+
+    @Test func aWordWrappedOverRowsSelectsWholeFromEitherRow() {
+        let text = "one doubleclickword two"
+        for (col, row) in [(3, 1), (6, 0), (8, 1)] {
+            #expect(doubleClick(text, at: col, row: row, cols: 10) == "doubleclickword",
+                    "col \(col) row \(row)")
+        }
+        #expect(doubleClick("xxxxdoubleclickword", at: 3, row: 1, cols: 10) == "xxxxdoubleclickword")
+    }
+
+    @Test func aHardNewlineStillEndsAWord() {
+        #expect(doubleClick("abcdefghij\r\nklm", at: 1, row: 1, cols: 10) == "klm")
+        #expect(doubleClick("abcdefghij\r\nklm", at: 9, row: 0, cols: 10) == "abcdefghij")
+    }
+
+    @Test func aWideCharacterThatWrapsKeepsTheWordWhole() {
+        // The wide glyph does not fit in column 9, so it moves to the next row.
+        let text = "xxxxxxxxx日ab"
+        #expect(doubleClick(text, at: 3, row: 1, cols: 10) == text)
+        #expect(doubleClick(text, at: 0, row: 0, cols: 10) == text)
+    }
+
+    @Test func aCombiningMarkAtTheWrapKeepsTheWordWhole() {
+        let text = "xxxxxxxxe\u{301}yz"
+        #expect(doubleClick(text, at: 0, row: 1, cols: 10) == text)
+    }
 }

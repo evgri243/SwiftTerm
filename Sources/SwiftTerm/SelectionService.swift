@@ -781,6 +781,28 @@ public class SelectionService: CustomDebugStringConvertible {
      */
     func simpleScanSelection (from position: Position, in buffer: Buffer, includeFunc: (Character)-> Bool)
     {
+        // Scan the logical line, so a word wrapped over rows stays whole and a hard
+        // newline still ends it.
+        let cells = logicalLineCells (through: position, in: buffer)
+        if let index = cells.firstIndex (where: {
+            $0.row == position.row && $0.col <= position.col && position.col < $0.col + $0.width
+        }) {
+            var lo = index
+            while lo > 0, includeFunc (cells [lo - 1].character) {
+                lo -= 1
+            }
+            var hi = index
+            while hi + 1 < cells.count, includeFunc (cells [hi + 1].character) {
+                hi += 1
+            }
+            if includeFunc (cells [index].character) {
+                let first = cells [lo]
+                let last = cells [hi]
+                start = Position (col: first.col, row: first.row)
+                end = Position (col: last.col + last.width, row: last.row)
+                return
+            }
+        }
         // Look backward
         var colScan = position.col
         var left = colScan

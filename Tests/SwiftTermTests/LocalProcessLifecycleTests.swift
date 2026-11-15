@@ -661,6 +661,9 @@ final class LocalProcessLifecycleTests: XCTestCase {
     func testDeinitStopsBlockedWriteAfterReapWithDescendantHoldingSlave() throws {
         let delegate = LifecycleDelegate()
         var process: LocalProcess? = LocalProcess(delegate: delegate)
+        // The check below needs the descendant alive. A late test thread must not meet
+        // the default escalation, whose group SIGKILL also kills the descendant.
+        process!.killEscalationDelay = 30
         try process!.startProcessChecked(executable: "/bin/sh", args: ["-c",
             "stty -echo raw; exec 9<&0; /bin/sh -c 'trap \"\" HUP TERM; while :; do sleep 1; done' & printf '%s\\n' $!; while :; do :; done"
         ]).get()
